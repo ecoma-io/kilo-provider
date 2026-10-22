@@ -1,0 +1,22 @@
+# ============================================================================
+# Example configuration for kilo-provider
+# ============================================================================
+
+[proxy_pool]
+reload_interval_secs = 1
+connect_timeout_secs = 10
+proxies = [
+    "http://proxy-a.example.internal:8080",
+    "http://proxy-b.example.internal:8080",
+]
+
+[models]
+refresh_interval_secs = 300
+stale_ttl_secs = 900
+max_entries = 2048
+
+[circuit_breaker]
+proxy_failure_cooldown_secs = 60
+rate_limit_cooldown_secs = 120
+model_not_found_cooldown_secs = 300
+half_open_max_probes = 1

@@ -1,0 +1,15 @@
+.git
+.gitignore
+.github
+target
+README.md
+config.example.toml
+Dockerfile
+.dockerignore
+.release-please*
+config.toml
+*.local.toml
+.env
+.env.*
+*.pem
+*.key
