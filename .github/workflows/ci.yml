@@ -1,0 +1,115 @@
+# CI — quality gates for every push to main and every pull request.
+# This repository is a single Rust crate with no cargo features, so the cargo
+# commands below need no feature flags. Docker image build verification
+# (native amd64) also runs here; the multi-arch GHCR publish is release.yml's
+# job (see comments there for why it is not a tag/release-event workflow).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+# Least privilege: CI only reads the repository/code.
+permissions:
+  contents: read
+
+# Good practice: cancel superseded runs for the same ref (rapid successive
+# pushes to main, or new commits pushed to the same PR) instead of queueing.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Rust checks (fmt -> clippy -> test -> build)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        id: checkout
+        uses: actions/checkout@v7
+
+      # Installs the latest stable Rust toolchain via rustup. The default
+      # profile already includes rustfmt + clippy, so no additional apt
+      # packages or component installs are needed.
+      - name: Install stable Rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Caches ~/.cargo and the workspace target/ directory across runs
+      # (keyed on toolchain version + Cargo.lock contents).
+      - name: Configure Rust caches
+        id: rust-cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Check formatting
+        id: fmt
+        run: cargo fmt --all -- --check
+
+      - name: Lint with clippy
+        id: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        id: test
+        run: cargo test --workspace --all-features
+
+      - name: Build locked release binary
+        id: build
+        run: cargo build --locked --release
+
+  docker:
+    name: Verify Dockerfile builds (amd64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        id: checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Build-only verification: with push: false + load: false the full layer
+      # graph is built and stored in the GitHub Actions cache, but no image is
+      # exported to the local daemon or pushed to any registry.
+      #
+      # No "platforms" on purpose: one native amd64 build is enough to prove
+      # the Dockerfile assembles; arm64 is exercised by the multi-arch publish
+      # in release.yml.
+      #
+      # No RUST_VERSION/ALPINE_VERSION build-args on purpose: the Dockerfile
+      # ARG defaults are the single source of truth for toolchain versions —
+      # redeclaring them here would create a value that silently drifts when
+      # the Dockerfile is bumped. Pass them explicitly (per build) only if CI
+      # should ever pin independently of the Dockerfile.
+      - name: Build Docker image (verification only)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: false
+          # GitHub Actions cache backend. A cache miss is safe (e.g. on fork
+          # pull requests, which have their own cache namespace): buildx just
+          # starts from scratch — documented assumption.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Write verification summary
+        run: |
+          {
+            echo '## Docker image verification'
+            echo ''
+            echo 'amd64 (native) build of `Dockerfile` completed successfully; nothing was pushed.'
+          } >> "$GITHUB_STEP_SUMMARY"

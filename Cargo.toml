@@ -1,0 +1,36 @@
+# Single binary crate `kilo-provider` at the repository root.
+#
+# NOTE: this package is deliberately NOT split into a multi-crate workspace.
+# There is no parent workspace, so this single package IS the workspace for
+# CI purposes (clippy/test/build all run from the repository root).
+[package]
+name = "kilo-provider"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Anonymous HTTP provider gateway in front of the Kilo upstream API"
+publish = false
+
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
+axum = "0.8"
+# Minimal feature set: rustls-based TLS with webpki roots, HTTP/1 (always on
+# in reqwest 0.12, no feature flag), JSON bodies. No default TLS stack, no
+# HTTP/2, no system-proxy discovery.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-webpki-roots",
+    "stream",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+futures-util = "0.3"
+httpdate = "1"
+bytes = "1"
+thiserror = "2"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

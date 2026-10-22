@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+
+# Local runtime/config files (the tracked config.example.toml stays;
+# never commit a real configuration since it may hold real endpoints)
+config.toml
+*.local.toml
+
+# Local environment files
+.env
+.env.*
+
+# Editors / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
