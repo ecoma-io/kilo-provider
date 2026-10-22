@@ -1,6 +1,7 @@
 //! Circuit breakers with three independent scopes.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,64 @@ impl Entry {
             cooldown: Duration::ZERO,
             half_open_inflight: 0,
         }
+    }
+}
+
+/// RAII lease for a transport half-open reservation. Cancels the
+/// reservation (releasing the probe slot) when dropped, including when the
+/// owning future is cancelled/dropped mid-flight.
+pub struct TransportGuard {
+    cb: Arc<CircuitBreaker>,
+    proxy_id: String,
+}
+
+impl Drop for TransportGuard {
+    fn drop(&mut self) {
+        self.cb.transport_cancel(&self.proxy_id);
+    }
+}
+
+impl TransportGuard {
+    pub fn proxy_id(&self) -> &str {
+        &self.proxy_id
+    }
+}
+
+pub struct RateLimitGuard {
+    cb: Arc<CircuitBreaker>,
+    proxy_id: String,
+    origin: String,
+}
+
+impl Drop for RateLimitGuard {
+    fn drop(&mut self) {
+        self.cb.rate_limit_cancel(&self.proxy_id, &self.origin);
+    }
+}
+
+impl RateLimitGuard {
+    pub fn proxy_id(&self) -> &str {
+        &self.proxy_id
+    }
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+}
+
+pub struct ModelGuard {
+    cb: Arc<CircuitBreaker>,
+    model_id: String,
+}
+
+impl Drop for ModelGuard {
+    fn drop(&mut self) {
+        self.cb.model_cancel(&self.model_id);
+    }
+}
+
+impl ModelGuard {
+    pub fn model_id(&self) -> &str {
+        &self.model_id
     }
 }
 
@@ -291,6 +350,64 @@ impl CircuitBreaker {
         e.opened_at = Some(Instant::now());
         e.cooldown = cooldown;
         e.half_open_inflight = 0;
+    }
+
+    // RAII guards (leak-safe on cancellation/drop).
+    pub fn transport_reserve_guard(self: &Arc<Self>, proxy_id: &str) -> Option<TransportGuard> {
+        if self.transport_reserve(proxy_id) {
+            Some(TransportGuard {
+                cb: self.clone(),
+                proxy_id: proxy_id.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+    pub fn transport_lease(self: &Arc<Self>, proxy_id: &str) -> Option<TransportGuard> {
+        self.transport_reserve_guard(proxy_id)
+    }
+    pub fn transport_try_acquire_guard(self: &Arc<Self>, proxy_id: &str) -> Option<TransportGuard> {
+        self.transport_reserve_guard(proxy_id)
+    }
+    pub fn transport_acquire_guard(self: &Arc<Self>, proxy_id: &str) -> Option<TransportGuard> {
+        self.transport_reserve_guard(proxy_id)
+    }
+
+    pub fn rate_limit_reserve_guard(
+        self: &Arc<Self>,
+        proxy_id: &str,
+        origin: &str,
+    ) -> Option<RateLimitGuard> {
+        if self.rate_limit_reserve(proxy_id, origin) {
+            Some(RateLimitGuard {
+                cb: self.clone(),
+                proxy_id: proxy_id.to_string(),
+                origin: origin.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+    pub fn rate_limit_lease(
+        self: &Arc<Self>,
+        proxy_id: &str,
+        origin: &str,
+    ) -> Option<RateLimitGuard> {
+        self.rate_limit_reserve_guard(proxy_id, origin)
+    }
+
+    pub fn model_reserve_guard(self: &Arc<Self>, model_id: &str) -> Option<ModelGuard> {
+        if self.model_reserve(model_id) {
+            Some(ModelGuard {
+                cb: self.clone(),
+                model_id: model_id.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+    pub fn model_lease(self: &Arc<Self>, model_id: &str) -> Option<ModelGuard> {
+        self.model_reserve_guard(model_id)
     }
 
     // helpers

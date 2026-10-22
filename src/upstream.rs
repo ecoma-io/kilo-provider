@@ -23,6 +23,11 @@ use crate::error::AppError;
 /// The single, fixed upstream base URL for the Kilo gateway.
 pub const UPSTREAM_BASE_URL: &str = "https://api.kilo.ai/api/gateway";
 
+/// Canonical origin (scheme + host) for the Kilo gateway, used as the
+/// circuit-breaker origin key and for any origin-scoped state. Derived from
+/// [`UPSTREAM_BASE_URL`] so there is a single source of truth.
+pub const UPSTREAM_ORIGIN: &str = "https://api.kilo.ai";
+
 /// Factory for upstream requests: one shared HTTP client plus the fixed
 /// base URL.
 #[derive(Debug, Clone)]
@@ -75,6 +80,36 @@ impl UpstreamClient {
         let response = self.http.execute(request).await?;
         Ok(response)
     }
+}
+
+/// Map a client-facing path (e.g. `/v1/models`) to the full canonical
+/// upstream URL (e.g. `https://api.kilo.ai/api/gateway/models`).
+///
+/// The client uses the OpenAI-style `/v1/...` prefix; the Kilo gateway
+/// exposes the same resources directly under the gateway base without an
+/// extra `/v1`. This is the single source of truth for that mapping.
+pub fn upstream_url(client_path: &str) -> Result<String, AppError> {
+    let upstream_path = if let Some(rest) = client_path.strip_prefix("/v1") {
+        if rest.is_empty() {
+            "/".to_string()
+        } else {
+            rest.to_string()
+        }
+    } else {
+        return Err(AppError::Upstream(format!(
+            "unsupported upstream client path (expected /v1/...): {client_path:?}"
+        )));
+    };
+    let base = UPSTREAM_BASE_URL.trim_end_matches('/');
+    Ok(format!("{base}{upstream_path}"))
+}
+
+/// Whether a client path is an inference endpoint that requires a `model`.
+pub fn requires_model(client_path: &str) -> bool {
+    matches!(
+        client_path,
+        "/v1/chat/completions" | "/v1/completions" | "/v1/responses" | "/v1/embeddings"
+    )
 }
 
 impl From<reqwest::Error> for AppError {

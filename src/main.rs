@@ -13,7 +13,7 @@ use kilo_provider::config::Config;
 use kilo_provider::error::AppError;
 use kilo_provider::proxy_pool::ProxyPool;
 use kilo_provider::router::{AppState, build_router};
-use kilo_provider::upstream::UPSTREAM_BASE_URL;
+use kilo_provider::upstream::{UPSTREAM_BASE_URL, UPSTREAM_ORIGIN};
 
 fn main() {
     if let Err(err) = run() {
@@ -43,6 +43,7 @@ fn run() -> Result<(), AppError> {
         Duration::from_secs(config.models.refresh_interval_secs),
     ));
     let _upstream_base = UPSTREAM_BASE_URL;
+    let _ = UPSTREAM_ORIGIN;
 
     let state = AppState {
         proxy_pool: proxy_pool.clone(),
@@ -56,8 +57,12 @@ fn run() -> Result<(), AppError> {
         .build()
         .map_err(AppError::Io)?;
     runtime.block_on(async move {
-        // initial refresh (bounded)
-        do_refresh(&proxy_pool, &circuit_breaker, &catalog, &config).await;
+        // initial refresh with its own deadline; do not hang startup
+        let _ = tokio::time::timeout(
+            Duration::from_secs(30),
+            do_refresh(&proxy_pool, &circuit_breaker, &catalog, &config),
+        )
+        .await;
 
         // shutdown coordination
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -69,11 +74,12 @@ fn run() -> Result<(), AppError> {
         let cfg_clone = state.config.clone();
         let path = config_path.clone();
         let mut reload_rx = shutdown_rx.clone();
-        let mut _rx = shutdown_rx.clone();
         let reload_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(
-                cfg_clone.read().unwrap().proxy_pool.reload_interval_secs,
-            ));
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now()
+                    + Duration::from_secs(cfg_clone.read().unwrap().proxy_pool.reload_interval_secs.max(1)),
+                Duration::from_secs(cfg_clone.read().unwrap().proxy_pool.reload_interval_secs.max(1)),
+            );
             loop {
                 tokio::select! {
                     _ = reload_rx.changed() => {
@@ -84,46 +90,41 @@ fn run() -> Result<(), AppError> {
                 if *reload_rx.borrow() {
                     break;
                 }
-                // reload interval may have changed; recreate interval each tick using current config
-                let current_interval = cfg_clone
-                    .read()
-                    .unwrap()
-                    .proxy_pool
-                    .reload_interval_secs
-                    .max(1);
-                interval = tokio::time::interval(Duration::from_secs(current_interval));
-
-                // attempt reload
-                if let Ok(new_cfg) = Config::load_from_path(&path) {
-                    // validate by rebuilding pool (atomic swap only on success)
-                    let old_fp = pool_clone.fingerprint();
-                    let new_fp = ProxyPool::fingerprint_of(&new_cfg.proxy_pool);
-                    if old_fp != new_fp {
-                        if pool_clone.reload(&new_cfg.proxy_pool).is_ok() {
-                            cb_clone.update_config(&new_cfg.circuit_breaker);
-                            cat_clone.update_config(
-                                Duration::from_secs(new_cfg.models.stale_ttl_secs),
-                                Duration::from_secs(new_cfg.models.refresh_interval_secs),
-                                new_cfg.models.max_entries,
-                            );
-                            *cfg_clone.write().unwrap() = new_cfg;
-                        } else {
-                            tracing::error!("proxy pool reload failed; keeping last good snapshot");
+                match Config::load_from_path(&path) {
+                    Ok(new_cfg) => {
+                        let old_fp = pool_clone.fingerprint();
+                        let new_fp = ProxyPool::fingerprint_of(&new_cfg.proxy_pool);
+                        // always attempt pool reload (validates+builds before swap)
+                        match pool_clone.reload(&new_cfg.proxy_pool) {
+                            Ok(()) => {
+                                let pool_changed = old_fp != new_fp;
+                                cb_clone.update_config(&new_cfg.circuit_breaker);
+                                cat_clone.update_config(
+                                    Duration::from_secs(new_cfg.models.stale_ttl_secs),
+                                    Duration::from_secs(new_cfg.models.refresh_interval_secs),
+                                    new_cfg.models.max_entries,
+                                );
+                                *cfg_clone.write().unwrap() = new_cfg;
+                                if !pool_changed {
+                                    // breaker state already preserved because proxy ids stable
+                                    tracing::debug!("config reloaded; proxy identity unchanged, breaker state preserved");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("proxy pool reload failed; keeping last good snapshot: {e}");
+                            }
                         }
-                    } else {
-                        // config identical fingerprint; still sync cb/catalog/config if other fields changed
-                        // Compare full config? We'll update if reload_interval etc changed.
-                        cb_clone.update_config(&new_cfg.circuit_breaker);
-                        cat_clone.update_config(
-                            Duration::from_secs(new_cfg.models.stale_ttl_secs),
-                            Duration::from_secs(new_cfg.models.refresh_interval_secs),
-                            new_cfg.models.max_entries,
-                        );
-                        *cfg_clone.write().unwrap() = new_cfg;
                     }
-                } else {
-                    tracing::error!("config reload failed; keeping last good snapshot");
+                    Err(e) => {
+                        tracing::error!("config reload failed; keeping last good snapshot: {e}");
+                    }
                 }
+                // update polling interval from current config
+                let new_iv = cfg_clone.read().unwrap().proxy_pool.reload_interval_secs.max(1);
+                interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(new_iv),
+                    Duration::from_secs(new_iv),
+                );
             }
         });
 
@@ -219,8 +220,7 @@ async fn do_refresh(
     _config: &Config,
 ) {
     use kilo_provider::catalog::fetch_catalog;
-    let origin = "https://api.kilo.ai".to_string();
-    // reserve a proxy for this refresh
+    let origin = UPSTREAM_ORIGIN.to_string();
     let reserved = pool.reserve(cb, &origin);
     let (proxy, pid) = match reserved {
         Some(p) => {
@@ -232,14 +232,11 @@ async fn do_refresh(
     let http = match &proxy {
         Some(p) => p.client().clone(),
         None => {
-            // fail closed: no direct
             catalog.mark_error("no proxy available for catalog refresh".to_string());
             return;
         }
     };
     let base = reqwest::Url::parse(UPSTREAM_BASE_URL).unwrap();
-    let proxy_url = proxy.as_ref().map(|p| p.id.clone());
-    let _ = proxy_url;
     match fetch_catalog(&http, &base, None).await {
         Ok(models) => {
             catalog.replace(models);
@@ -252,12 +249,19 @@ async fn do_refresh(
             tracing::error!("catalog refresh failed: {e}");
             catalog.mark_error(e.to_string());
             if let Some(id) = &pid {
-                // transport only failure if connect? mark transport failure
-                cb.transport_record_failure(id);
+                if e.is_connect() {
+                    cb.transport_record_failure(id);
+                } else if e.is_rate_limited() {
+                    cb.rate_limit_record_failure(id, &origin, e.retry_after());
+                    cb.transport_record_success(id);
+                } else {
+                    // HTTP other or schema: do not quarantine transport
+                    cb.transport_record_success(id);
+                    cb.rate_limit_record_success(id, &origin);
+                }
             }
         }
     }
-    // release reserved slots
     if let Some(id) = &pid {
         cb.transport_cancel(id);
         cb.rate_limit_cancel(id, &origin);

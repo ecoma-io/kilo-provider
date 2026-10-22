@@ -11,11 +11,19 @@ use sha2::{Digest, Sha256};
 use crate::config::ProxyPoolConfig;
 use crate::error::AppError;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProxyClient {
     pub id: String,
-    pub url: Url,
     client: reqwest::Client,
+}
+
+impl std::fmt::Debug for ProxyClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyClient")
+            .field("id", &self.id)
+            .field("url", &"[redacted]")
+            .finish()
+    }
 }
 
 impl ProxyClient {
@@ -93,11 +101,12 @@ impl ProxyPool {
                 .map_err(|err| AppError::Config(format!("invalid proxy configuration: {err}")))?;
             let client = reqwest::Client::builder()
                 .proxy(proxy)
+                .no_proxy()
                 .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
                 .build()
                 .map_err(|err| AppError::Config(format!("could not build proxy client: {err}")))?;
             let id = redacted_id(&url, url_str);
-            proxies.push(Arc::new(ProxyClient { id, url, client }));
+            proxies.push(Arc::new(ProxyClient { id, client }));
         }
         let snap = Arc::new(PoolSnapshot {
             proxies,

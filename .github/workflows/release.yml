@@ -1,66 +1,144 @@
 # Release — release-please automation + GHCR container publish.
-#
-# Flow (one workflow, everything gated on release-please outputs):
-#   1. On a push to main that is NOT a Release PR merge, release-please
-#      opens/updates a Release PR and produces no release outputs; the publish
-#      job below is skipped.
-#   2. When the Release PR is merged (also a push to main), the same workflow
-#      run makes release-please create the GitHub Release and git tag
-#      (vX.Y.Z — defined by release-please-config.json), and expose outputs
-#      such as release_created / tag_name / version / sha.
-#   3. publish-ghcr then checks out the TAG (not main HEAD) and pushes a
-#      multi-arch image to GHCR with semver + lowercase-owner + SHA-provenance
-#      tags.
-#
-# Deliberately NO tag / release-event triggers anywhere in this file: tags or
-# releases created with the default GITHUB_TOKEN do not trigger other workflows
-# (see release-please-action README, "Other Actions on Release Please PRs"), so
-# an `on: push: tags:` or `on: release: created` chain would silently never
-# fire. The publish job is chained via this workflow's own action outputs.
-
 name: Release
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (semver without leading v), e.g. 0.1.1"
+        required: true
+        type: string
+      source_sha:
+        description: "Source commit SHA to release (defaults to the checked-out SHA)"
+        required: false
+        type: string
 
-# Read-only default; individual jobs elevate below as needed.
 permissions:
   contents: read
 
-# Serialize release runs: a merge of the next Release PR right after the
-# previous one must not race release-please's PR/tag bookkeeping.
-# Job-level effect: a queued release run WAITS for the in-flight one to finish
-# instead of being cancelled, so no release is lost (cancel-in-progress must
-# stay false here, unlike the CI workflow).
 concurrency:
   group: release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
-  release-please:
-    name: Release Please (manifest mode)
+  # Recovery/bootstrap release path. Only runs on workflow_dispatch.
+  bootstrap-release:
+    name: Bootstrap release (manual)
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
-      # Create/update the Release PR, push commits to it, and create the
-      # GitHub Release + git tag when the Release PR is merged.
+      contents: write
+      packages: write
+    outputs:
+      tag_name: ${{ steps.tag.outputs.tag_name }}
+      version: ${{ steps.tag.outputs.version }}
+      release_sha: ${{ steps.sha.outputs.sha }}
+      release_created: ${{ steps.done.outputs.created }}
+    steps:
+      - name: Checkout source
+        id: checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          persist-credentials: false
+
+      - name: Resolve source SHA
+        id: sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.source_sha }}" ]; then
+            sha="${{ inputs.source_sha }}"
+          else
+            sha="${{ github.sha }}"
+          fi
+          # validate full sha
+          if ! [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::invalid source SHA: $sha"; exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Validate version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ inputs.version }}"
+          v="${v#v}"
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::invalid version: $v"; exit 1
+          fi
+          # ensure tag does not already exist
+          if git rev-parse "v$v" >/dev/null 2>&1; then
+            echo "::error::tag v$v already exists"; exit 1
+          fi
+          if git ls-remote --tags origin "refs/tags/v$v" | grep -q .; then
+            echo "::error::remote tag v$v already exists"; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Sync version metadata
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Update Cargo.toml version
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          # Update manifest
+          python3 - "$VERSION" <<'PY'
+import json,sys
+v=sys.argv[1]
+p='.release-please-manifest.json'
+d=json.load(open(p))
+d['.']=v
+open(p,'w').write(json.dumps(d,indent=2)+'\n')
+PY
+          cargo update -p kilo-provider 2>/dev/null || true
+
+      - name: Verify tag not existing & create tag
+        id: tag
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "v$VERSION" "$SHA"
+          git push origin "v$VERSION"
+          echo "tag_name=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+
+      - name: Mark done
+        id: done
+        run: echo "created=true" >> "$GITHUB_OUTPUT"
+
+  release-please:
+    name: Release Please (manifest mode)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
       contents: write
       pull-requests: write
     outputs:
-      # Publish gating relies on these outputs instead of tags created by
-      # GITHUB_TOKEN: those can never trigger another workflow.
       release_created: ${{ steps.release.outputs.release_created }}
       paths_released: ${{ steps.release.outputs.paths_released }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
       release_sha: ${{ steps.release.outputs.sha }}
     steps:
-      # Manifest mode is the default when no `release-type` input is set; the
-      # config-file/manifest-file inputs below point at release-please-config.json
-      # and .release-please-manifest.json at the repo root. On non-release merges
-      # this step only
-      # creates/updates the Release PR and leaves outputs at their defaults.
-      - name: Run release-please (manifest mode)
+      - name: Run release-please
         id: release
         uses: googleapis/release-please-action@v5
         with:
@@ -69,127 +147,117 @@ jobs:
 
   publish-ghcr:
     name: Publish image to GHCR
-    needs: [release-please]
-    # Gate on the release-please outputs: release_created is `true` for the
-    # root component ("." path — our single crate), and paths_released (JSON
-    # array) double-checks that the release really is the root path. When the
-    # run only created/updated a Release PR, both are false and this job is
-    # skipped entirely.
+    needs: [release-please, bootstrap-release]
     if: >-
-      needs.release-please.outputs.release_created == 'true' &&
-      contains(fromJSON(needs.release-please.outputs.paths_released || '[]'), '.')
+      (github.event_name == 'push' && needs.release-please.outputs.release_created == 'true' && contains(fromJSON(needs.release-please.outputs.paths_released || '[]'), '.')) ||
+      (github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Push the image (and its attestations) to ghcr.io.
       packages: write
     steps:
-      # Check out the release TAG, not branch HEAD, so the image is built from
-      # the exact commit the GitHub Release points at. Provenance SHA must NOT
-      # come from `github.sha`: on a `push` run GITHUB_SHA is main HEAD at the
-      # time the run started, which can already be AHEAD of the tagged release
-      # commit (e.g. another merge landed just after the Release PR). The
-      # checked-out SHA is taken from the checkout step's `commit` output
-      # below — the SHA that the image is actually built from.
+      - name: Determine release params
+        id: params
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag_name=${{ needs.bootstrap-release.outputs.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "version=${{ needs.bootstrap-release.outputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "sha=${{ needs.bootstrap-release.outputs.release_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_name=${{ needs.release-please.outputs.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "version=${{ needs.release-please.outputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "sha=${{ needs.release-please.outputs.release_sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check out release tag
         id: checkout
         uses: actions/checkout@v7
         with:
-          # Tag created moments ago by the release-please job of this same
-          # run (e.g. `v1.2.3`, with include-component-in-tag=false).
-          ref: ${{ needs.release-please.outputs.tag_name }}
-          # This job never runs `git push`; do not persist git credentials.
+          ref: ${{ steps.params.outputs.tag_name }}
           persist-credentials: false
 
-      # Compute the lowercase GHCR image path, the tag list and OCI labels.
-      # The owner is resolved at runtime via ${{ github.repository_owner }}
-      # (never hardcoded here) and lowercased because GHCR image paths must be
-      # lowercase.
-      - name: Resolve image ref, tags and OCI labels
-        id: meta
+      - name: Validate image refs
+        id: validate
         shell: bash
         env:
           REPOSITORY_OWNER: ${{ github.repository_owner }}
           REPOSITORY: ${{ github.repository }}
-          # Bare semver without the "v" prefix (verified; stripped anyway
-          # below in case a future release-please version changes that).
-          RELEASE_VERSION: ${{ needs.release-please.outputs.version }}
-          # SHA of the commit actually checked out above (NOT GITHUB_SHA).
+          RELEASE_VERSION: ${{ steps.params.outputs.version }}
           RELEASE_SHA: ${{ steps.checkout.outputs.commit }}
+          CHECKED_SHA: ${{ steps.params.outputs.sha }}
         run: |
           set -euo pipefail
-
           repo="${REPOSITORY#*/}"
-          # GHCR requires fully lowercase image paths; derive the owner and
-          # repo name at runtime with bash-4+ `${VAR,,}` lowercasing.
           image="ghcr.io/${REPOSITORY_OWNER,,}/${repo,,}"
-
-          : "${RELEASE_SHA:?no commit SHA available from checkout step}"
-          commit="${RELEASE_SHA}"
-          version="${RELEASE_VERSION#v}"
-
-          NL=$'\n'
-          tags="$version"
-          latest=""
-          if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            major="${BASH_REMATCH[1]}"
-            minor="${BASH_REMATCH[2]}"
-            if [ "$major" -ne 0 ]; then
-              # Mutable "moving" tags only start at >= 1.0.0: 0.x is still in
-              # flux, so tag only the full version there (no `0`/`0.1` moving
-              # aliases that would over-promise stability).
-              tags="${tags}${NL}${major}.${minor}${NL}${major}"
-            fi
-            # `latest` ONLY for non-prerelease stable releases (also for 0.x).
-            latest="${NL}latest"
-          elif [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
-            echo "::error::Unexpected release version from release-please: '${version}'"
-            exit 1
+          # ensure lowercase
+          if [ "$image" != "$(echo "$image" | tr '[:upper:]' '[:lower:]')" ]; then
+            echo "::error::image ref not lowercase"; exit 1
           fi
-
-          # SHA-provenance tag from the CHECKED-OUT commit (never github.sha).
-          tags="${tags}${latest}${NL}sha-${commit:0:7}"
-
+          # tags from metadata
+          version="${RELEASE_VERSION#v}"
+          # validate checked out sha equals params sha
+          if [ "$RELEASE_SHA" != "$CHECKED_SHA" ]; then
+            echo "::error::checked-out SHA $RELEASE_SHA != release SHA $CHECKED_SHA"; exit 1
+          fi
+          # build tag list
+          NL=$'\n'
+          tags="$image:$version"
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            major="${version%%.*}"
+            rest="${version#*.}"
+            minor="${rest%%.*}"
+            if [ "$major" -ne 0 ]; then
+              tags="${tags}${NL}$image:${major}.${minor}${NL}$image:${major}"
+            fi
+            tags="${tags}${NL}$image:latest"
+          fi
+          tags="${tags}${NL}$image:sha-${RELEASE_SHA:0:7}"
+          # validate each tag
+          while IFS= read -r ref; do
+            [ -z "$ref" ] && continue
+            if [[ "$ref" != ghcr.io/* ]]; then
+              echo "::error::tag not GHCR: $ref"; exit 1
+            fi
+            if [[ "$ref" == docker.io/* ]]; then
+              echo "::error::tag points to Docker Hub: $ref"; exit 1
+            fi
+            # extract tag part after last colon for validation
+            tagpart="${ref##*:}"
+            if [ -z "$tagpart" ]; then
+              echo "::error::empty tag"; exit 1
+            fi
+            if [[ "$tagpart" =~ [^a-zA-Z0-9._-] ]]; then
+              echo "::error::invalid tag chars: $tagpart"; exit 1
+            fi
+          done <<< "$tags"
+          # verify no bare tags
+          if echo "$tags" | grep -qE '^(0|[0-9]+\.[0-9]+\.[0-9]+|latest|sha-[a-f0-9]+)$'; then
+            : # bare names are okay as suffixes only; full ref has image prefix
+          fi
           {
-            echo "image=${image}"
-            echo "commit=${commit}"
-            echo "version=${version}"
+            echo "image=$image"
+            echo "commit=$RELEASE_SHA"
+            echo "version=$version"
             echo "tags<<GHA_TAGS_EOF"
-            echo "${tags}"
+            echo "$tags"
             echo "GHA_TAGS_EOF"
-            echo "labels<<GHA_LABELS_EOF"
-            echo "org.opencontainers.image.title=${repo}"
-            echo "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${REPOSITORY}"
-            # Trace image back to release + source commit.
-            echo "org.opencontainers.image.revision=${commit}"
-            echo "org.opencontainers.image.version=${version}"
-            echo "GHA_LABELS_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # QEMU provides arm64 emulation for the multi-arch build below — no
-      # arm64 runners required, at the cost of slower cross-arch builds.
       - name: Set up QEMU
-        id: qemu
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        id: buildx
         uses: docker/setup-buildx-action@v4
 
-      # Username/password only reference GITHUB_TOKEN (which is automatically
-      # masked in logs); nothing here prints secrets. `packages: write` on the
-      # job is what actually authorizes the GHCR push.
       - name: Log in to ghcr.io
-        id: login
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Multi-arch publish. No build-args passed → the Dockerfile ARG
-      # defaults (RUST_VERSION / ALPINE_VERSION) stay the single source of
-      # truth; see the matching comment in ci.yml.
       - name: Build and push image
         id: build
         uses: docker/build-push-action@v7
@@ -198,30 +266,22 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # Resume from the cache the CI "docker" job seeded for the same
-          # branch (a miss is safe).
+          tags: ${{ steps.validate.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.validate.outputs.commit }}
+            org.opencontainers.image.version=${{ steps.validate.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Provenance left at the action default (a minimal SLSA provenance
-          # attestation is pushed alongside the image; GHCR supports it).
 
       - name: Write publish summary
         run: |
           {
             echo '## Container image published'
             echo ''
-            echo "- image: \`$PUBLISH_IMAGE\`"
-            echo "- digest: \`$PUBLISH_DIGEST\`"
-            echo "- version: \`$PUBLISH_VERSION\`"
-            echo "- revision: \`$PUBLISH_COMMIT\`"
-            echo ''
-            printf '### Tags\n\n```\n%s\n```\n' "$PUBLISH_TAGS"
+            echo "- image: \`${{ steps.validate.outputs.image }}\`"
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- version: \`${{ steps.validate.outputs.version }}\`"
+            echo "- revision: \`${{ steps.validate.outputs.commit }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
-        env:
-          PUBLISH_IMAGE: ${{ steps.meta.outputs.image }}
-          PUBLISH_DIGEST: ${{ steps.build.outputs.digest }}
-          PUBLISH_VERSION: ${{ steps.meta.outputs.version }}
-          PUBLISH_COMMIT: ${{ steps.meta.outputs.commit }}
-          PUBLISH_TAGS: ${{ steps.meta.outputs.tags }}

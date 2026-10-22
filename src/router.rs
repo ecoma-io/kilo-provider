@@ -15,7 +15,7 @@ use crate::circuit_breaker::CircuitBreaker;
 use crate::config::Config;
 use crate::error::ApiError;
 use crate::proxy_pool::ProxyPool;
-use crate::upstream::UPSTREAM_BASE_URL;
+use crate::upstream::{UPSTREAM_ORIGIN, requires_model, upstream_url};
 
 pub struct AppState {
     pub proxy_pool: Arc<ProxyPool>,
@@ -55,7 +55,7 @@ async fn healthz() -> impl IntoResponse {
 }
 
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    let origin = "https://api.kilo.ai".to_string();
+    let origin = UPSTREAM_ORIGIN.to_string();
     let proxy_available = state
         .proxy_pool
         .select(&state.circuit_breaker, &origin)
@@ -86,7 +86,11 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn models_handler(State(state): State<AppState>) -> impl IntoResponse {
     if let Some(snap) = state.catalog.current() {
-        (StatusCode::OK, Json(json!({ "data": snap.models }))).into_response()
+        (
+            StatusCode::OK,
+            Json(json!({ "object": "list", "data": snap.models })),
+        )
+            .into_response()
     } else {
         ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -104,19 +108,25 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
     if !(path == "/v1" || path.starts_with("/v1/")) {
         return ApiError::not_found(format!("no route for path {path:?}")).into_response();
     }
-    let rest = path.strip_prefix("/v1").unwrap_or("");
-    let rest = if rest.is_empty() || rest == "/" {
-        if rest.is_empty() { "/" } else { rest }
-    } else {
-        rest
+
+    // Classify endpoint: inference endpoints require a model; /v1/models is
+    // handled by models_handler; other /v1/* paths are proxied without model.
+    let is_models_list = path == "/v1/models";
+    if is_models_list {
+        // should not reach here (route registered), but be safe
+        return ApiError::not_found("no route".to_string()).into_response();
+    }
+
+    let mut url = match upstream_url(&path) {
+        Ok(u) => u,
+        Err(e) => {
+            return ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: e.to_string(),
+            }
+            .into_response();
+        }
     };
-    // ensure leading slash for join semantics: base + rest
-    let rest = if rest.starts_with('/') {
-        rest.to_string()
-    } else {
-        format!("/{}", rest)
-    };
-    let mut url = format!("{}{}", UPSTREAM_BASE_URL, rest);
     if let Some(q) = uri.query() {
         url = format!("{}?{}", url, q);
     }
@@ -133,21 +143,72 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
         }
     };
 
-    let model_id = extract_model(&body_bytes);
-    let origin = "https://api.kilo.ai".to_string();
+    let origin = UPSTREAM_ORIGIN.to_string();
 
-    // model allowlist validation against current catalog
-    if let Some(mid) = &model_id
-        && !state.catalog.contains_model(mid)
-    {
-        return ApiError {
-            status: StatusCode::BAD_REQUEST,
-            message: "model not allowed".to_string(),
+    // Determine whether this is an inference endpoint requiring model.
+    let inference = requires_model(&path);
+
+    // Parse model from body for inference endpoints.
+    let model_id: Option<String> = if inference {
+        // require valid JSON object with string model
+        if body_bytes.is_empty() {
+            return ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: "missing model".to_string(),
+            }
+            .into_response();
         }
-        .into_response();
+        let v: Value = match serde_json::from_slice(&body_bytes) {
+            Ok(v) => v,
+            Err(_) => {
+                return ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "invalid JSON body".to_string(),
+                }
+                .into_response();
+            }
+        };
+        match v.get("model").and_then(|m| m.as_str()) {
+            Some(s) if !s.is_empty() => Some(s.to_string()),
+            Some(_) => {
+                return ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "model must be a string".to_string(),
+                }
+                .into_response();
+            }
+            None => {
+                return ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "missing model".to_string(),
+                }
+                .into_response();
+            }
+        }
+    } else {
+        extract_model(&body_bytes)
+    };
+
+    // Catalog must be ready (fail-closed) before any inference.
+    if inference {
+        if state.catalog.current().is_none() {
+            return ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "model catalog not ready".to_string(),
+            }
+            .into_response();
+        }
+        let mid = model_id.as_ref().unwrap();
+        if !state.catalog.contains_model(mid) {
+            return ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: "model not allowed".to_string(),
+            }
+            .into_response();
+        }
     }
 
-    // model breaker reserve (once)
+    // model breaker reserve (once) for inference
     let model_reserved = if let Some(mid) = &model_id {
         if !state.circuit_breaker.model_reserve(mid) {
             return ApiError {
@@ -165,6 +226,7 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
 
     let max_attempts = state.proxy_pool.len().max(1);
     let mut last_error: Option<String> = None;
+    let mut last_retry_after: Option<std::time::Duration> = None;
     for _ in 0..max_attempts {
         let proxy = state.proxy_pool.reserve(&state.circuit_breaker, &origin);
         let proxy = match proxy {
@@ -223,8 +285,12 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
                         .circuit_breaker
                         .rate_limit_record_failure(&pid, &origin, retry_after);
                     state.circuit_breaker.transport_record_success(&pid);
-                    // retry on 429 across proxies
+                    // Collect retry-after for final response.
+                    if let Some(ra) = retry_after {
+                        last_retry_after = Some(ra);
+                    }
                     last_error = Some("rate limited".to_string());
+                    // retry with another proxy if available
                     continue;
                 }
                 if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
@@ -254,6 +320,19 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
     if model_reserved && let Some(mid) = &model_id {
         state.circuit_breaker.model_cancel(mid);
     }
+    if last_error.as_deref() == Some("rate limited") {
+        let mut resp = ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "upstream rate limited".to_string(),
+        }
+        .into_response();
+        if let Some(ra) = last_retry_after
+            && let Ok(v) = HeaderValue::from_str(&ra.as_secs().to_string())
+        {
+            resp.headers_mut().insert("retry-after", v);
+        }
+        return resp;
+    }
     ApiError {
         status: StatusCode::BAD_GATEWAY,
         message: format!(
@@ -265,20 +344,29 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
 }
 
 fn stream_response(resp: reqwest::Response) -> Response {
+    // Collect connection-listed headers from upstream.
+    let mut connection_listed: Vec<String> = Vec::new();
+    if let Some(v) = resp.headers().get("connection")
+        && let Ok(s) = v.to_str()
+    {
+        for part in s.split(',') {
+            connection_listed.push(part.trim().to_lowercase());
+        }
+    }
     let status = resp.status();
     let mut headers = HeaderMap::new();
     for (k, v) in resp.headers() {
-        if is_hop_by_hop(k.as_str()) {
+        let name = k.as_str().to_lowercase();
+        if is_hop_by_hop(&name) {
             continue;
         }
-        let name = k.clone();
-        headers.insert(name, v.clone());
+        if connection_listed.iter().any(|c| c == &name) {
+            continue;
+        }
+        headers.insert(k.clone(), v.clone());
     }
-    // also filter connection-listed headers
-    if let Some(conn) = headers.get("connection").cloned() {
-        // remove listed
-        let _ = conn;
-    }
+    // remove connection header itself
+    headers.remove("connection");
     let stream = resp
         .bytes_stream()
         .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
@@ -401,7 +489,7 @@ half_open_max_probes = 1
             std::time::Duration::from_secs(1),
         );
         catalog.replace(vec![
-            serde_json::json!({"id":"m:free","pricing":{"prompt":"0"}}),
+            serde_json::json!({"id":"m:free","pricing":{"prompt":"0","completion":"0"}}),
         ]);
         AppState {
             proxy_pool: Arc::new(ProxyPool::from_config(&config.proxy_pool).expect("pool")),

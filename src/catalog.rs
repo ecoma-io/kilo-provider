@@ -6,8 +6,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::error::AppError;
-
 #[derive(Debug, Clone)]
 pub struct CatalogSnapshot {
     pub models: Vec<Value>,
@@ -159,21 +157,40 @@ pub fn filter_free_models(models: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-fn is_free_model(id: &str, meta: &Value) -> bool {
-    // Verified aliases (must still satisfy pricing evidence below).
-    let _ = id;
+const KNOWN_PRICING_FIELDS: &[&str] = &[
+    "prompt",
+    "completion",
+    "request",
+    "image",
+    "audio",
+    "web_search",
+    "internal_reasoning",
+    "input_cache_read",
+    "input_cache_write",
+    "discount",
+];
+
+fn is_free_model(_id: &str, meta: &Value) -> bool {
+    // Free-ness is derived solely from pricing metadata. The `isFree` flag is
+    // deliberately NOT consulted (upstream may omit/misreport it).
     let pricing = match meta.get("pricing") {
         Some(p) => p,
-        None => return false, // no pricing metadata => fail closed
+        None => return false,
     };
-    // pricing must be object non-empty
     let obj = match pricing.as_object() {
         Some(o) if !o.is_empty() => o,
         _ => return false,
     };
-    // all pricing fields must parse to number and be exactly 0 (no negatives, no unparseable)
-    for val in obj.values() {
-        let n = match val {
+    // Required input + output price fields must both be present.
+    if !obj.contains_key("prompt") || !obj.contains_key("completion") {
+        return false;
+    }
+    // Every field must be a known pricing key with a valid numeric value of 0.
+    for (k, v) in obj {
+        if !KNOWN_PRICING_FIELDS.contains(&k.as_str()) {
+            return false; // unrecognized metadata => fail closed
+        }
+        let n = match v {
             Value::String(s) => match s.trim().parse::<f64>() {
                 Ok(x) => x,
                 Err(_) => return false,
@@ -188,20 +205,48 @@ fn is_free_model(id: &str, meta: &Value) -> bool {
             return false;
         }
     }
-    // if isFree present, must be true
-    if let Some(is_free) = meta.get("isFree")
-        && is_free != &Value::Bool(true)
-    {
-        return false;
-    }
     true
+}
+
+#[derive(Debug, Clone)]
+pub enum CatalogFetchError {
+    Connect(String),
+    RateLimited(Option<std::time::Duration>),
+    Http(u16, String),
+    Schema(String),
+}
+
+impl std::fmt::Display for CatalogFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(m) => write!(f, "connect/transport error: {m}"),
+            Self::RateLimited(_) => write!(f, "HTTP 429 rate limited"),
+            Self::Http(s, m) => write!(f, "HTTP {s}: {m}"),
+            Self::Schema(m) => write!(f, "catalog schema error: {m}"),
+        }
+    }
+}
+
+impl CatalogFetchError {
+    pub fn is_connect(&self) -> bool {
+        matches!(self, Self::Connect(_))
+    }
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::RateLimited(r) => *r,
+            _ => None,
+        }
+    }
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, Self::RateLimited(_))
+    }
 }
 
 pub async fn fetch_catalog(
     client: &reqwest::Client,
     base_url: &reqwest::Url,
     _proxy_url: Option<&str>,
-) -> Result<Vec<Value>, AppError> {
+) -> Result<Vec<Value>, CatalogFetchError> {
     let mut url = base_url.clone();
     let base_path = url.path().trim_end_matches('/');
     url.set_path(&format!("{}/models", base_path));
@@ -210,35 +255,44 @@ pub async fn fetch_catalog(
         .get(url.clone())
         .send()
         .await
-        .map_err(|e| AppError::Upstream(format!("catalog request failed: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(AppError::Upstream(format!(
-            "catalog fetch failed: HTTP {}",
-            resp.status()
-        )));
+        .map_err(|e| CatalogFetchError::Connect(e.to_string()))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs);
+        return Err(CatalogFetchError::RateLimited(retry_after));
+    }
+    if !status.is_success() {
+        return Err(CatalogFetchError::Http(
+            status.as_u16(),
+            format!("catalog fetch failed: HTTP {status}"),
+        ));
     }
     // content-type check (optional but helpful)
     // read bytes
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| AppError::Upstream(format!("catalog body read failed: {e}")))?;
+        .map_err(|e| CatalogFetchError::Connect(format!("catalog body read failed: {e}")))?;
     let v: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| AppError::Upstream(format!("catalog JSON parse failed: {e}")))?;
-    let data = v
-        .get("data")
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| AppError::Upstream("catalog response missing 'data' array".to_string()))?;
+        .map_err(|e| CatalogFetchError::Schema(format!("catalog JSON parse failed: {e}")))?;
+    let data = v.get("data").and_then(|d| d.as_array()).ok_or_else(|| {
+        CatalogFetchError::Schema("catalog response missing 'data' array".to_string())
+    })?;
     // validate each entry has string id
     for m in data {
         if m.get("id").and_then(|x| x.as_str()).is_none() {
-            return Err(AppError::Upstream(
+            return Err(CatalogFetchError::Schema(
                 "catalog entry missing string 'id'".to_string(),
             ));
         }
     }
     if data.is_empty() {
-        return Err(AppError::Upstream(
+        return Err(CatalogFetchError::Schema(
             "catalog returned empty data".to_string(),
         ));
     }
@@ -302,7 +356,9 @@ mod tests {
     #[test]
     fn stale_ttl() {
         let c = ModelCatalog::new(10, Duration::from_secs(0), Duration::from_secs(10));
-        c.replace(vec![json!({"id":"x:free","pricing":{"prompt":"0"}})]);
+        c.replace(vec![
+            json!({"id":"x:free","pricing":{"prompt":"0","completion":"0"}}),
+        ]);
         assert!(c.current().is_none());
         assert!(c.last_good().is_some());
     }
@@ -311,14 +367,18 @@ mod tests {
     fn ready_after_replace() {
         let c = ModelCatalog::new(10, Duration::from_secs(900), Duration::from_secs(300));
         assert!(!c.is_ready());
-        c.replace(vec![json!({"id":"x:free","pricing":{"prompt":"0"}})]);
+        c.replace(vec![
+            json!({"id":"x:free","pricing":{"prompt":"0","completion":"0"}}),
+        ]);
         assert!(c.is_ready());
     }
 
     #[test]
     fn empty_replace_does_not_overwrite() {
         let c = ModelCatalog::new(10, Duration::from_secs(900), Duration::from_secs(300));
-        c.replace(vec![json!({"id":"x:free","pricing":{"prompt":"0"}})]);
+        c.replace(vec![
+            json!({"id":"x:free","pricing":{"prompt":"0","completion":"0"}}),
+        ]);
         assert!(c.is_ready());
         c.replace(vec![json!({"id":"paid","pricing":{"prompt":"1"}})]);
         // still ready with old snapshot
@@ -330,16 +390,16 @@ mod tests {
     fn max_entries_reload() {
         let c = ModelCatalog::new(2, Duration::from_secs(900), Duration::from_secs(300));
         c.replace(vec![
-            json!({"id":"a:free","pricing":{"prompt":"0"}}),
-            json!({"id":"b:free","pricing":{"prompt":"0"}}),
-            json!({"id":"c:free","pricing":{"prompt":"0"}}),
+            json!({"id":"a:free","pricing":{"prompt":"0","completion":"0"}}),
+            json!({"id":"b:free","pricing":{"prompt":"0","completion":"0"}}),
+            json!({"id":"c:free","pricing":{"prompt":"0","completion":"0"}}),
         ]);
         assert_eq!(c.len(), 2);
         c.update_config(Duration::from_secs(900), Duration::from_secs(300), 10);
         c.replace(vec![
-            json!({"id":"a:free","pricing":{"prompt":"0"}}),
-            json!({"id":"b:free","pricing":{"prompt":"0"}}),
-            json!({"id":"c:free","pricing":{"prompt":"0"}}),
+            json!({"id":"a:free","pricing":{"prompt":"0","completion":"0"}}),
+            json!({"id":"b:free","pricing":{"prompt":"0","completion":"0"}}),
+            json!({"id":"c:free","pricing":{"prompt":"0","completion":"0"}}),
         ]);
         assert_eq!(c.len(), 3);
     }
@@ -347,7 +407,9 @@ mod tests {
     #[test]
     fn contains_model() {
         let c = ModelCatalog::new(10, Duration::from_secs(900), Duration::from_secs(300));
-        c.replace(vec![json!({"id":"x:free","pricing":{"prompt":"0"}})]);
+        c.replace(vec![
+            json!({"id":"x:free","pricing":{"prompt":"0","completion":"0"}}),
+        ]);
         assert!(c.contains_model("x:free"));
         assert!(!c.contains_model("nope"));
     }

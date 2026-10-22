@@ -1,10 +1,9 @@
 # kilo-provider
 
-An anonymous HTTP provider gateway in front of the Kilo upstream API
-(`https://api.kilo.ai/api/gateway`) — **bootstrap scaffold**: the plumbing
-(axum HTTP server, strict env-var startup, single TOML config file, upstream
-client, proxy-pool / catalog / circuit-breaker placeholders) is in place;
-business behavior lands in follow-up PRs.
+Anonymous HTTP provider gateway in front of the Kilo upstream API
+(`https://api.kilo.ai/api/gateway`). It exposes OpenAI-compatible inference
+endpoints, filters the upstream model catalog to free models only, and routes
+traffic through a configurable pool of outbound proxies with circuit breakers.
 
 ## Requirements
 
@@ -15,103 +14,89 @@ Two environment variables are **required**, with **no defaults anywhere**:
 | `PORT`         | Listening port; must be a valid integer in `1..=65535`.                   |
 | `CONFIG_PATH`  | Path to the single TOML configuration file; must be readable.             |
 
-If either is missing or invalid, the process prints a clear error to stderr
-and exits with a non-zero status **before binding any listener**.
-
-The listening port and the upstream location are **not** configurable in the
-config file: the upstream base URL is a fixed code constant and access is
-anonymous (no `Authorization` header is ever sent, and the HTTP client
-ignores system/env proxy settings via `.no_proxy()`).
+Optional: `RUST_LOG`, `LOG_FORMAT=json`, `GRACEFUL_SHUTDOWN_TIMEOUT_SECS`.
 
 ## Configuration
 
-See [`config.example.toml`](config.example.toml) — copy it and point
-`CONFIG_PATH` at your copy. It must contain a `[proxy_pool]` section with a
-required `proxies` key (the list may be empty):
+Copy `config.example.toml` and point `CONFIG_PATH` at your copy. Full schema:
 
 ```toml
 [proxy_pool]
-proxies = []
+reload_interval_secs = 1       # hot-reload polling interval
+connect_timeout_secs = 10      # per-proxy connect timeout
+proxies = ["http://user:pass@host:port", ...]   # at least one required
+
+[models]
+refresh_interval_secs = 300    # periodic catalog refresh
+stale_ttl_secs = 900           # snapshot validity window
+max_entries = 2048             # cap on catalog size
+
+[circuit_breaker]
+proxy_failure_cooldown_secs = 60
+rate_limit_cooldown_secs = 120
+model_not_found_cooldown_secs = 300
+half_open_max_probes = 1
 ```
 
-Placeholder-only entries look like:
-
-```toml
-[proxy_pool]
-proxies = [
-  "http://proxy-a.example.internal:8080",
-]
-```
-
-Unknown fields and missing required keys are rejected at startup with a
-descriptive error.
+Proxy pool must not be empty; there is no direct (non-proxy) fallback.
 
 ## HTTP endpoints
 
-| Endpoint      | Method | Purpose                                                        |
-| ------------- | ------ | -------------------------------------------------------------- |
-| `/healthz`    | GET    | Liveness — `{"status":"ok"}`                                    |
-| `/readyz`     | GET    | Readiness — ready once config is loaded and clients are built.  |
-| anything else | GET/…  | JSON 404 fallback `{"error": "..."}`                            |
+| Endpoint                  | Method | Purpose                                                        |
+| ------------------------- | ------ | -------------------------------------------------------------- |
+| `/healthz`                | GET    | Liveness — `{"status":"ok"}`                                   |
+| `/readyz`                 | GET    | Readiness — ready once config loaded, proxy available, catalog ready |
+| `/v1/models`              | GET    | OpenAI-compatible list of free models (`object: "list"`)         |
+| `/v1/chat/completions`    | POST   | Inference forwarding                                           |
+| `/v1/responses`           | POST   | Inference forwarding                                           |
+| `/v1/embeddings`          | POST   | Inference forwarding                                           |
+| `/v1/completions`         | POST   | Inference forwarding                                           |
+
+Inference requires a `model` present in the current free catalog. Unknown
+models are rejected with 400 before upstream. Anonymous access only: no
+`Authorization` header is ever sent to Kilo.
 
 ## Logging
 
-`tracing` + `tracing-subscriber`:
-
-* `RUST_LOG` is honored when set; it defaults to `info`.
-* `LOG_FORMAT=json` selects JSON-formatted log lines; anything else uses the
-  default formatter.
-
-Startup logs report the listening port, the config path (never the file
-contents), and the initial placeholder counts.
+`tracing` + `tracing-subscriber`: `RUST_LOG` honored, defaults to `info`.
+`LOG_FORMAT=json` selects JSON lines.
 
 ## Local development
 
 ```sh
 cargo build --locked --release
 CONFIG_PATH=config.example.toml PORT=8085 ./target/release/kilo-provider
-
-# tests / lint / format
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
 ```
+
+Tests / lint / format:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+```
+
+## Local E2E
+
+Requires a real `config.toml` (not committed). Run:
+
+```sh
+CONFIG_PATH=/path/to/config.toml PORT=18099 ./scripts/e2e-local.sh
+```
+
+Live E2E is not run in CI.
 
 ## Docker
 
 ```sh
-docker build -t kilo-provider:bootstrap .
+docker build -t kilo-provider:verification .
 
 docker run --rm -p 8085:8085 \
   -e PORT=8085 \
-  -e CONFIG_PATH=/etc/kilo-provider/config.example.toml \
-  -v ./config.example.toml:/etc/kilo-provider/config.example.toml:ro \
-  kilo-provider:bootstrap
-
-curl http://127.0.0.1:8085/healthz   # {"status":"ok"}
-curl http://127.0.0.1:8085/readyz    # {"status":"ready", ...}
-
-# Missing PORT → fast, non-zero exit with a clear error:
-docker run --rm \
-  -e CONFIG_PATH=/etc/kilo-provider/config.example.toml \
-  -v ./config.example.toml:/etc/kilo-provider/config.example.toml:ro \
-  kilo-provider:bootstrap
+  -e CONFIG_PATH=/etc/kilo-provider/config.toml \
+  -v ./config.toml:/etc/kilo-provider/config.toml:ro \
+  kilo-provider:verification
 ```
 
-The image is a multi-stage build (pinned `rust:1.98-slim` builder →
-`debian:bookworm-slim` runtime) containing only the release binary and
-`ca-certificates`; it runs as non-root (uid/gid 10001), bakes in no config
-file, sets no default `PORT`, and exposes nothing.
-
-## Bootstrap scope
-
-Intentionally unimplemented placeholders (marked `TODO(bootstrap)` in code):
-
-* **proxy_pool** — entries are loaded/validated, but rotation and hot reload
-  are not implemented.
-* **model catalog** — in-memory cache shape only; no upstream listing or
-  filtering.
-* **circuit breaker** — `Closed/Open/HalfOpen` states exist, `allow()`
-  returns `true`; transitions are not implemented.
-* **upstream client** — builds anonymous requests against the fixed base
-  URL; no requests are made at startup.
+Multi-stage build, CA certificates, non-root user (uid 10001). No config or
+secrets are baked into the image.
