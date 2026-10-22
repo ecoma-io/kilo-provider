@@ -88,14 +88,7 @@ jobs:
           # Update Cargo.toml version
           sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
           # Update manifest
-          python3 - "$VERSION" <<'PY'
-import json,sys
-v=sys.argv[1]
-p='.release-please-manifest.json'
-d=json.load(open(p))
-d['.']=v
-open(p,'w').write(json.dumps(d,indent=2)+'\n')
-PY
+python3 -c "import json; p='.release-please-manifest.json'; d=json.load(open(p)); d['.']=$VERSION; open(p,'w').write(json.dumps(d,indent=2)+'\n')"
           cargo update -p kilo-provider 2>/dev/null || true
 
       - name: Verify tag not existing & create tag
