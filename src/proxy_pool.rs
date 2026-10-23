@@ -177,6 +177,35 @@ impl ProxyPool {
         }
         None
     }
+
+    /// Reserve a proxy and return leak-safe guards for both transport and
+    /// rate-limit scopes. Guards cancel their reservations on drop, including
+    /// when the owning future is cancelled.
+    pub fn reserve_guarded(
+        &self,
+        breaker: &std::sync::Arc<crate::circuit_breaker::CircuitBreaker>,
+        origin: &str,
+    ) -> Option<(
+        Arc<ProxyClient>,
+        crate::circuit_breaker::TransportGuard,
+        crate::circuit_breaker::RateLimitGuard,
+    )> {
+        let snap = self.snapshot();
+        let n = snap.proxies.len();
+        if n == 0 {
+            return None;
+        }
+        let start = self.rr.fetch_add(1, Ordering::Relaxed) % n;
+        for i in 0..n {
+            let p = &snap.proxies[(start + i) % n];
+            if let Some(tg) = breaker.transport_reserve_guard(&p.id)
+                && let Some(rg) = breaker.rate_limit_reserve_guard(&p.id, origin)
+            {
+                return Some((p.clone(), tg, rg));
+            }
+        }
+        None
+    }
 }
 
 fn redacted_id(url: &Url, raw: &str) -> String {
