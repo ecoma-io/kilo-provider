@@ -410,6 +410,28 @@ impl CircuitBreaker {
         self.model_reserve_guard(model_id)
     }
 
+    // Non-reserving RAII guards: attach leak-safe cancellation to a slot that
+    // has already been reserved (e.g. by ProxyPool::reserve). Drop cancels.
+    pub fn transport_guard(self: &Arc<Self>, proxy_id: &str) -> TransportGuard {
+        TransportGuard {
+            cb: self.clone(),
+            proxy_id: proxy_id.to_string(),
+        }
+    }
+    pub fn rate_limit_guard(self: &Arc<Self>, proxy_id: &str, origin: &str) -> RateLimitGuard {
+        RateLimitGuard {
+            cb: self.clone(),
+            proxy_id: proxy_id.to_string(),
+            origin: origin.to_string(),
+        }
+    }
+    pub fn model_guard(self: &Arc<Self>, model_id: &str) -> ModelGuard {
+        ModelGuard {
+            cb: self.clone(),
+            model_id: model_id.to_string(),
+        }
+    }
+
     // helpers
     pub fn transport_state(&self, proxy_id: &str) -> BreakerState {
         self.transport
@@ -590,6 +612,91 @@ mod tests {
         cb.transport_record_failure("p0");
         std::thread::sleep(Duration::from_millis(5));
         assert!(cb.transport_reserve("p0"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn async_cancel_releases_half_open_slot() {
+        use std::sync::Arc;
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            proxy_failure_cooldown_secs: 0,
+            half_open_max_probes: 1,
+            ..cfg()
+        }));
+        cb.transport_record_failure("p0");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let cb2 = cb.clone();
+        let fut = async move {
+            let _g = cb2.transport_reserve_guard("p0").expect("probe slot");
+            std::future::pending::<()>().await;
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(20), fut).await;
+        // The future was cancelled; the guard must have released the slot,
+        // so a new probe can acquire it without another failure transition.
+        assert!(
+            cb.transport_reserve("p0"),
+            "subsequent probe must acquire after cancellation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn async_rate_limit_cancel_releases_slot() {
+        use std::sync::Arc;
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            rate_limit_cooldown_secs: 0,
+            half_open_max_probes: 1,
+            ..cfg()
+        }));
+        cb.rate_limit_record_failure("p0", "origin", None);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let cb2 = cb.clone();
+        let fut = async move {
+            let _g = cb2
+                .rate_limit_reserve_guard("p0", "origin")
+                .expect("probe slot");
+            std::future::pending::<()>().await;
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(20), fut).await;
+        assert!(
+            cb.rate_limit_reserve("p0", "origin"),
+            "subsequent probe must acquire after cancellation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn async_model_cancel_releases_slot() {
+        use std::sync::Arc;
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            model_not_found_cooldown_secs: 0,
+            half_open_max_probes: 1,
+            ..cfg()
+        }));
+        cb.model_record_failure("m0");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let cb2 = cb.clone();
+        let fut = async move {
+            let _g = cb2.model_reserve_guard("m0").expect("probe slot");
+            std::future::pending::<()>().await;
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(20), fut).await;
+        assert!(
+            cb.model_reserve("m0"),
+            "subsequent probe must acquire after cancellation"
+        );
+    }
+
+    #[test]
+    fn double_cancel_is_idempotent() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            proxy_failure_cooldown_secs: 0,
+            half_open_max_probes: 1,
+            ..cfg()
+        });
+        cb.transport_record_failure("p0");
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(cb.transport_reserve("p0"));
+        cb.transport_cancel("p0");
+        cb.transport_cancel("p0");
+        assert_eq!(cb.half_open_inflight_transport("p0"), 0);
     }
 
     #[test]

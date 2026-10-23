@@ -86,9 +86,27 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn models_handler(State(state): State<AppState>) -> impl IntoResponse {
     if let Some(snap) = state.catalog.current() {
+        // Normalize to the OpenAI-compatible /v1/models schema: every entry
+        // must carry object="model", created and owned_by even when the
+        // upstream omits them.
+        let data: Vec<Value> = snap
+            .models
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                if let Some(obj) = m.as_object_mut() {
+                    obj.entry("object".to_string())
+                        .or_insert_with(|| json!("model"));
+                    obj.entry("created".to_string()).or_insert_with(|| json!(0));
+                    obj.entry("owned_by".to_string())
+                        .or_insert_with(|| json!("kilo"));
+                }
+                m
+            })
+            .collect();
         (
             StatusCode::OK,
-            Json(json!({ "object": "list", "data": snap.models })),
+            Json(json!({ "object": "list", "data": data })),
         )
             .into_response()
     } else {
@@ -208,18 +226,21 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
         }
     }
 
-    // model breaker reserve (once) for inference
-    let model_reserved = if let Some(mid) = &model_id {
-        if !state.circuit_breaker.model_reserve(mid) {
-            return ApiError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "model circuit breaker open".to_string(),
+    // model breaker reserve (once) for inference, with a leak-safe guard so
+    // the slot is released even if this request future is cancelled/dropped.
+    let model_guard: Option<crate::circuit_breaker::ModelGuard> = if let Some(mid) = &model_id {
+        match state.circuit_breaker.model_reserve_guard(mid) {
+            Some(g) => Some(g),
+            None => {
+                return ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: "model circuit breaker open".to_string(),
+                }
+                .into_response();
             }
-            .into_response();
         }
-        true
     } else {
-        false
+        None
     };
 
     let forward_headers = filter_headers(&headers);
@@ -228,13 +249,12 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
     let mut last_error: Option<String> = None;
     let mut last_retry_after: Option<std::time::Duration> = None;
     for _ in 0..max_attempts {
-        let proxy = state.proxy_pool.reserve(&state.circuit_breaker, &origin);
-        let proxy = match proxy {
-            Some(p) => p,
+        let reserved = state
+            .proxy_pool
+            .reserve_guarded(&state.circuit_breaker, &origin);
+        let (proxy, tg, rg) = match reserved {
+            Some(r) => r,
             None => {
-                if model_reserved && let Some(mid) = &model_id {
-                    state.circuit_breaker.model_cancel(mid);
-                }
                 return ApiError {
                     status: StatusCode::SERVICE_UNAVAILABLE,
                     message: "no proxy available".to_string(),
@@ -254,21 +274,18 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
 
         match rb.send().await {
             Err(e) => {
-                let is_connect = e.is_connect();
+                let is_connect = e.is_connect() || e.is_timeout();
                 if is_connect {
                     state.circuit_breaker.transport_record_failure(&pid);
                     state.circuit_breaker.rate_limit_cancel(&pid, &origin);
                 } else {
-                    // unknown transport error after possible send: do not retry; cancel slots
                     state.circuit_breaker.transport_cancel(&pid);
                     state.circuit_breaker.rate_limit_cancel(&pid, &origin);
                 }
                 last_error = Some(e.to_string());
+                drop(tg);
+                drop(rg);
                 if !is_connect {
-                    // do not retry
-                    if model_reserved && let Some(mid) = &model_id {
-                        state.circuit_breaker.model_cancel(mid);
-                    }
                     return ApiError {
                         status: StatusCode::BAD_GATEWAY,
                         message: format!("upstream request failed: {}", e),
@@ -285,12 +302,12 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
                         .circuit_breaker
                         .rate_limit_record_failure(&pid, &origin, retry_after);
                     state.circuit_breaker.transport_record_success(&pid);
-                    // Collect retry-after for final response.
                     if let Some(ra) = retry_after {
                         last_retry_after = Some(ra);
                     }
                     last_error = Some("rate limited".to_string());
-                    // retry with another proxy if available
+                    drop(tg);
+                    drop(rg);
                     continue;
                 }
                 if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
@@ -301,25 +318,22 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
                     state
                         .circuit_breaker
                         .rate_limit_record_success(&pid, &origin);
-                    if model_reserved && let Some(_mid) = &model_id {}
-                    return stream_response(resp);
+                    return stream_response(resp, Some((tg, rg)), model_guard);
                 }
-                // other status: success path for breaker
                 state.circuit_breaker.transport_record_success(&pid);
                 state
                     .circuit_breaker
                     .rate_limit_record_success(&pid, &origin);
-                if let Some(mid) = &model_id {
+                if let Some(mid) = &model_id
+                    && status.is_success()
+                {
                     state.circuit_breaker.model_record_success(mid);
                 }
-                return stream_response(resp);
+                return stream_response(resp, Some((tg, rg)), model_guard);
             }
         }
     }
 
-    if model_reserved && let Some(mid) = &model_id {
-        state.circuit_breaker.model_cancel(mid);
-    }
     if last_error.as_deref() == Some("rate limited") {
         let mut resp = ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -343,7 +357,14 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
     .into_response()
 }
 
-fn stream_response(resp: reqwest::Response) -> Response {
+fn stream_response(
+    resp: reqwest::Response,
+    _guards: Option<(
+        crate::circuit_breaker::TransportGuard,
+        crate::circuit_breaker::RateLimitGuard,
+    )>,
+    _model_guard: Option<crate::circuit_breaker::ModelGuard>,
+) -> Response {
     // Collect connection-listed headers from upstream.
     let mut connection_listed: Vec<String> = Vec::new();
     if let Some(v) = resp.headers().get("connection")
@@ -367,9 +388,12 @@ fn stream_response(resp: reqwest::Response) -> Response {
     }
     // remove connection header itself
     headers.remove("connection");
-    let stream = resp
-        .bytes_stream()
-        .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
+    let held_guards = _guards;
+    let held_model_guard = _model_guard;
+    let stream = resp.bytes_stream().map(move |r| {
+        let _ = (&held_guards, &held_model_guard);
+        r.map_err(|e| std::io::Error::other(e.to_string()))
+    });
     let body = Body::from_stream(stream);
     let mut res = Response::new(body);
     *res.status_mut() = status;

@@ -215,57 +215,48 @@ fn run() -> Result<(), AppError> {
 
 async fn do_refresh(
     pool: &ProxyPool,
-    cb: &CircuitBreaker,
+    cb: &std::sync::Arc<CircuitBreaker>,
     catalog: &ModelCatalog,
     _config: &Config,
 ) {
     use kilo_provider::catalog::fetch_catalog;
     let origin = UPSTREAM_ORIGIN.to_string();
-    let reserved = pool.reserve(cb, &origin);
-    let (proxy, pid) = match reserved {
-        Some(p) => {
-            let id = p.id.clone();
-            (Some(p), Some(id))
-        }
-        None => (None, None),
-    };
-    let http = match &proxy {
-        Some(p) => p.client().clone(),
+    let reserved = pool.reserve_guarded(cb, &origin);
+    let (proxy, _tg, _rg) = match reserved {
+        Some(r) => r,
         None => {
             catalog.mark_error("no proxy available for catalog refresh".to_string());
             return;
         }
     };
+    let pid = proxy.id.clone();
+    let http = proxy.client().clone();
     let base = reqwest::Url::parse(UPSTREAM_BASE_URL).unwrap();
     match fetch_catalog(&http, &base, None).await {
         Ok(models) => {
             catalog.replace(models);
-            if let Some(id) = &pid {
-                cb.transport_record_success(id);
-                cb.rate_limit_record_success(id, &origin);
-            }
+            cb.transport_record_success(&pid);
+            cb.rate_limit_record_success(&pid, &origin);
         }
         Err(e) => {
             tracing::error!("catalog refresh failed: {e}");
             catalog.mark_error(e.to_string());
-            if let Some(id) = &pid {
-                if e.is_connect() {
-                    cb.transport_record_failure(id);
-                } else if e.is_rate_limited() {
-                    cb.rate_limit_record_failure(id, &origin, e.retry_after());
-                    cb.transport_record_success(id);
-                } else {
-                    // HTTP other or schema: do not quarantine transport
-                    cb.transport_record_success(id);
-                    cb.rate_limit_record_success(id, &origin);
-                }
+            if e.is_connect() {
+                cb.transport_record_failure(&pid);
+                cb.rate_limit_cancel(&pid, &origin);
+            } else if e.is_rate_limited() {
+                cb.rate_limit_record_failure(&pid, &origin, e.retry_after());
+                cb.transport_record_success(&pid);
+            } else {
+                // HTTP other or schema: do not quarantine transport
+                cb.transport_record_success(&pid);
+                cb.rate_limit_record_success(&pid, &origin);
             }
         }
     }
-    if let Some(id) = &pid {
-        cb.transport_cancel(id);
-        cb.rate_limit_cancel(id, &origin);
-    }
+    // Guards drop here, releasing half-open reservations (also on cancellation).
+    drop(_tg);
+    drop(_rg);
 }
 
 fn parse_graceful_timeout(raw: &str) -> Result<Duration, AppError> {
