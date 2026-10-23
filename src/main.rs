@@ -1,5 +1,6 @@
 //! Process entry point.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
@@ -42,6 +43,9 @@ fn run() -> Result<(), AppError> {
         Duration::from_secs(config.models.stale_ttl_secs),
         Duration::from_secs(config.models.refresh_interval_secs),
     ));
+    let admission = Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(
+        config.proxy_pool.max_concurrent_requests,
+    ))));
     let _upstream_base = UPSTREAM_BASE_URL;
     let _ = UPSTREAM_ORIGIN;
 
@@ -50,6 +54,7 @@ fn run() -> Result<(), AppError> {
         circuit_breaker: circuit_breaker.clone(),
         catalog: catalog.clone(),
         config: Arc::new(RwLock::new(config.clone())),
+        admission: admission.clone(),
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -57,12 +62,18 @@ fn run() -> Result<(), AppError> {
         .build()
         .map_err(AppError::Io)?;
     runtime.block_on(async move {
-        // initial refresh with its own deadline; do not hang startup
-        let _ = tokio::time::timeout(
-            Duration::from_secs(30),
-            do_refresh(&proxy_pool, &circuit_breaker, &catalog, &config),
-        )
-        .await;
+        // initial refresh in background; do not block listener binding
+        let pool0 = proxy_pool.clone();
+        let cb0 = circuit_breaker.clone();
+        let cat0 = catalog.clone();
+        let cfg0 = config.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(30),
+                do_refresh(&pool0, &cb0, &cat0, &cfg0),
+            )
+            .await;
+        });
 
         // shutdown coordination
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -71,6 +82,7 @@ fn run() -> Result<(), AppError> {
         let pool_clone = proxy_pool.clone();
         let cb_clone = circuit_breaker.clone();
         let cat_clone = catalog.clone();
+        let adm_clone = admission.clone();
         let cfg_clone = state.config.clone();
         let path = config_path.clone();
         let mut reload_rx = shutdown_rx.clone();
@@ -99,6 +111,22 @@ fn run() -> Result<(), AppError> {
                             Ok(()) => {
                                 let pool_changed = old_fp != new_fp;
                                 cb_clone.update_config(&new_cfg.circuit_breaker);
+                                // update admission semaphore capacity
+                                if adm_clone.read().unwrap().available_permits() != new_cfg.proxy_pool.max_concurrent_requests {
+                                    *adm_clone.write().unwrap() = Arc::new(tokio::sync::Semaphore::new(
+                                        new_cfg.proxy_pool.max_concurrent_requests,
+                                    ));
+                                }
+                                // cleanup breaker state for removed proxies (safe: keep active+probes)
+                                {
+                                    let active: HashSet<String> = pool_clone
+                                        .snapshot()
+                                        .proxies
+                                        .iter()
+                                        .map(|p| p.id.clone())
+                                        .collect();
+                                    cb_clone.retain_proxies(&active);
+                                }
                                 cat_clone.update_config(
                                     Duration::from_secs(new_cfg.models.stale_ttl_secs),
                                     Duration::from_secs(new_cfg.models.refresh_interval_secs),
@@ -135,19 +163,31 @@ fn run() -> Result<(), AppError> {
         let cfg2 = state.config.clone();
         let mut refresh_rx = shutdown_rx.clone();
         let refresh_handle = tokio::spawn(async move {
+            let mut backoff: u64 = 0;
             loop {
-                let iv = cfg2.read().unwrap().models.refresh_interval_secs.max(1);
+                let cfg = cfg2.read().unwrap().clone();
+                let ready = cat2.is_ready();
+                let sleep_secs = if ready {
+                    backoff = 0;
+                    cfg.models.refresh_interval_secs.max(1)
+                } else {
+                    if backoff == 0 {
+                        backoff = cfg.models.recovery_initial_backoff_secs.max(1);
+                    } else {
+                        backoff = (backoff * 2).min(cfg.models.recovery_max_backoff_secs.max(1));
+                    }
+                    backoff
+                };
                 tokio::select! {
                     _ = refresh_rx.changed() => {
                         if *refresh_rx.borrow() { break; }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(iv)) => {}
+                    _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
                 }
                 if *refresh_rx.borrow() {
                     break;
                 }
                 let cfg = cfg2.read().unwrap().clone();
-                // bounded timeout for catalog refresh
                 let _ = tokio::time::timeout(
                     Duration::from_secs(30),
                     do_refresh(&pool2, &cb2, &cat2, &cfg),
@@ -219,44 +259,74 @@ async fn do_refresh(
     catalog: &ModelCatalog,
     _config: &Config,
 ) {
+    use kilo_provider::catalog::CatalogFetchError;
     use kilo_provider::catalog::fetch_catalog;
     let origin = UPSTREAM_ORIGIN.to_string();
-    let reserved = pool.reserve_guarded(cb, &origin);
-    let (proxy, _tg, _rg) = match reserved {
-        Some(r) => r,
-        None => {
-            catalog.mark_error("no proxy available for catalog refresh".to_string());
-            return;
-        }
-    };
-    let pid = proxy.id.clone();
-    let http = proxy.client().clone();
     let base = reqwest::Url::parse(UPSTREAM_BASE_URL).unwrap();
-    match fetch_catalog(&http, &base, None).await {
-        Ok(models) => {
-            catalog.replace(models);
-            cb.transport_record_success(&pid);
-            cb.rate_limit_record_success(&pid, &origin);
+    let max_attempts = pool.len().max(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut last_err: Option<String> = None;
+    for _ in 0..max_attempts {
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
-        Err(e) => {
-            tracing::error!("catalog refresh failed: {e}");
-            catalog.mark_error(e.to_string());
-            if e.is_connect() {
-                cb.transport_record_failure(&pid);
-                cb.rate_limit_cancel(&pid, &origin);
-            } else if e.is_rate_limited() {
-                cb.rate_limit_record_failure(&pid, &origin, e.retry_after());
-                cb.transport_record_success(&pid);
-            } else {
-                // HTTP other or schema: do not quarantine transport
-                cb.transport_record_success(&pid);
-                cb.rate_limit_record_success(&pid, &origin);
+        let reserved = pool.reserve_guarded(cb, &origin);
+        let (proxy, mut tg, mut rg) = match reserved {
+            Some(r) => r,
+            None => {
+                // no proxy available right now
+                catalog.mark_error("no proxy available for catalog refresh".to_string());
+                return;
+            }
+        };
+        let pid = proxy.id.clone();
+        let http = proxy.client().clone();
+        match fetch_catalog(&http, &base, None).await {
+            Ok(models) => {
+                catalog.replace(models);
+                tg.record_success();
+                rg.record_success();
+                // also reset rate limit? record_success does
+                return;
+            }
+            Err(e) => {
+                last_err = Some(e.to_string());
+                match e {
+                    CatalogFetchError::Connect(_) => {
+                        cb.transport_record_failure_outcome(&pid, tg.lease_id());
+                        rg.record_success(); // cancel rate limit reservation? keep
+                        // Actually release rate limit probe
+                        // mark not quarantined for rate limit
+                    }
+                    CatalogFetchError::RateLimited(ra) => {
+                        let capped = ra; // already capped in cb? pass through
+                        cb.rate_limit_record_failure_outcome(&pid, &origin, rg.lease_id(), capped);
+                        tg.record_success();
+                    }
+                    CatalogFetchError::Http(_, _) => {
+                        // application error: do not quarantine transport
+                        tg.record_success();
+                        rg.record_success();
+                    }
+                    CatalogFetchError::Schema(_) => {
+                        tg.record_success();
+                        rg.record_success();
+                    }
+                }
+                // cancel guards to release any remaining reservations
+                // guards drop at end of iteration? We'll drop explicitly
+                drop(tg);
+                drop(rg);
+                // if connect failure, loop to next proxy
+                continue;
             }
         }
     }
-    // Guards drop here, releasing half-open reservations (also on cancellation).
-    drop(_tg);
-    drop(_rg);
+    if let Some(e) = last_err {
+        catalog.mark_error(e);
+    } else {
+        catalog.mark_error("catalog refresh failed".to_string());
+    }
 }
 
 fn parse_graceful_timeout(raw: &str) -> Result<Duration, AppError> {

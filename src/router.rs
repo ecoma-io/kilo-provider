@@ -22,6 +22,7 @@ pub struct AppState {
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub catalog: Arc<ModelCatalog>,
     pub config: Arc<RwLock<Config>>,
+    pub admission: Arc<RwLock<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -37,6 +38,7 @@ impl Clone for AppState {
             circuit_breaker: self.circuit_breaker.clone(),
             catalog: self.catalog.clone(),
             config: self.config.clone(),
+            admission: self.admission.clone(),
         }
     }
 }
@@ -150,12 +152,39 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
     }
 
     let headers = req.headers().clone();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024).await {
-        Ok(b) => b,
+
+    let sem = state.admission.read().unwrap().clone();
+    let permit = match sem.try_acquire_owned() {
+        Ok(p) => p,
         Err(_) => {
+            return ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "too many concurrent requests".to_string(),
+            }
+            .into_response();
+        }
+    };
+
+    let cfg = state.config.read().unwrap().clone();
+    let body_timeout = cfg.proxy_pool.request_body_timeout();
+    let body_bytes = match tokio::time::timeout(
+        body_timeout,
+        axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) => {
             return ApiError {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
                 message: "request body too large".to_string(),
+            }
+            .into_response();
+        }
+        Err(_) => {
+            return ApiError {
+                status: StatusCode::REQUEST_TIMEOUT,
+                message: "request body read timeout".to_string(),
             }
             .into_response();
         }
@@ -272,9 +301,19 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
             rb = rb.body(body_bytes.clone());
         }
 
-        match rb.send().await {
-            Err(e) => {
-                let is_connect = e.is_connect() || e.is_timeout();
+        let header_timeout = cfg.proxy_pool.response_header_timeout();
+        let send_res = tokio::time::timeout(header_timeout, rb.send()).await;
+        match send_res {
+            Err(_) => {
+                state.circuit_breaker.transport_cancel(&pid);
+                state.circuit_breaker.rate_limit_cancel(&pid, &origin);
+                last_error = Some("response header timeout".to_string());
+                drop(tg);
+                drop(rg);
+                continue;
+            }
+            Ok(Err(e)) => {
+                let is_connect = e.is_connect();
                 if is_connect {
                     state.circuit_breaker.transport_record_failure(&pid);
                     state.circuit_breaker.rate_limit_cancel(&pid, &origin);
@@ -294,7 +333,8 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
                 }
                 continue;
             }
-            Ok(resp) => {
+            Ok(Ok(resp)) => {
+                // handle below; bind resp in scope by using a nested block
                 let status = resp.status();
                 if status == StatusCode::TOO_MANY_REQUESTS {
                     let retry_after = parse_retry_after(resp.headers());
@@ -310,7 +350,7 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
                     drop(rg);
                     continue;
                 }
-                if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+                if (status == StatusCode::NOT_FOUND || status == StatusCode::GONE) && inference {
                     if let Some(mid) = &model_id {
                         state.circuit_breaker.model_record_failure(mid);
                     }
@@ -318,7 +358,13 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
                     state
                         .circuit_breaker
                         .rate_limit_record_success(&pid, &origin);
-                    return stream_response(resp, Some((tg, rg)), model_guard);
+                    return stream_response(
+                        resp,
+                        Some((tg, rg)),
+                        model_guard,
+                        cfg.proxy_pool.stream_idle_timeout(),
+                        Some(permit),
+                    );
                 }
                 state.circuit_breaker.transport_record_success(&pid);
                 state
@@ -326,10 +372,17 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
                     .rate_limit_record_success(&pid, &origin);
                 if let Some(mid) = &model_id
                     && status.is_success()
+                    && inference
                 {
                     state.circuit_breaker.model_record_success(mid);
                 }
-                return stream_response(resp, Some((tg, rg)), model_guard);
+                return stream_response(
+                    resp,
+                    Some((tg, rg)),
+                    model_guard,
+                    cfg.proxy_pool.stream_idle_timeout(),
+                    Some(permit),
+                );
             }
         }
     }
@@ -364,6 +417,8 @@ fn stream_response(
         crate::circuit_breaker::RateLimitGuard,
     )>,
     _model_guard: Option<crate::circuit_breaker::ModelGuard>,
+    idle: std::time::Duration,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Response {
     // Collect connection-listed headers from upstream.
     let mut connection_listed: Vec<String> = Vec::new();
@@ -390,10 +445,41 @@ fn stream_response(
     headers.remove("connection");
     let held_guards = _guards;
     let held_model_guard = _model_guard;
-    let stream = resp.bytes_stream().map(move |r| {
-        let _ = (&held_guards, &held_model_guard);
-        r.map_err(|e| std::io::Error::other(e.to_string()))
-    });
+    let held_permit = _permit;
+    let inner = resp.bytes_stream();
+    let stream = futures_util::stream::unfold(
+        (
+            inner,
+            held_guards,
+            held_model_guard,
+            held_permit,
+            idle,
+            false,
+        ),
+        |(mut s, hg, hmg, hp, idle, done)| async move {
+            if done {
+                return None;
+            }
+            match tokio::time::timeout(idle, s.next()).await {
+                Ok(Some(Ok(bytes))) => {
+                    let _ = (&hg, &hmg, &hp);
+                    Some((Ok(bytes), (s, hg, hmg, hp, idle, false)))
+                }
+                Ok(Some(Err(e))) => Some((
+                    Err(std::io::Error::other(e.to_string())),
+                    (s, hg, hmg, hp, idle, true),
+                )),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "stream idle timeout",
+                    )),
+                    (s, hg, hmg, hp, idle, true),
+                )),
+            }
+        },
+    );
     let body = Body::from_stream(stream);
     let mut res = Response::new(body);
     *res.status_mut() = status;
@@ -519,7 +605,10 @@ half_open_max_probes = 1
             proxy_pool: Arc::new(ProxyPool::from_config(&config.proxy_pool).expect("pool")),
             circuit_breaker: Arc::new(CircuitBreaker::default()),
             catalog: Arc::new(catalog),
-            config: Arc::new(RwLock::new(config)),
+            config: Arc::new(RwLock::new(config.clone())),
+            admission: Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(
+                config.proxy_pool.max_concurrent_requests,
+            )))),
         }
     }
 
