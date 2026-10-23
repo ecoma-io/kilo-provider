@@ -975,6 +975,14 @@ impl CircuitBreaker {
             .map(|e| e.generation)
             .unwrap_or(0)
     }
+    pub fn generation_model(&self, model_id: &str) -> u64 {
+        self.model
+            .lock()
+            .unwrap()
+            .get(model_id)
+            .map(|e| e.generation)
+            .unwrap_or(0)
+    }
 }
 
 fn check_entry(e: &mut Entry, half_open_max: usize) -> bool {
@@ -1187,6 +1195,98 @@ mod tests {
         assert!(
             cb.model_reserve("m0"),
             "subsequent probe must acquire after cancellation"
+        );
+    }
+
+    #[test]
+    fn stale_lease_cannot_close_or_open_new_generation() {
+        use std::sync::Arc;
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            proxy_failure_cooldown_secs: 0,
+            half_open_max_probes: 1,
+            retry_after_max_secs: 300,
+            ..cfg()
+        }));
+        // Request A takes a closed-state lease.
+        let lease_a = cb.transport_reserve_lease("p0").expect("lease A");
+        // Breaker opens (new generation) via an independent transition.
+        cb.transport_record_failure("p0");
+        // Probe transitions to half-open (newer generation).
+        let lease_b = cb.transport_reserve_lease("p0").expect("probe");
+        // Stale success from A must not close the breaker.
+        assert!(!cb.transport_record_success_lease("p0", lease_a));
+        assert_eq!(cb.transport_state("p0"), BreakerState::HalfOpen);
+        // Stale failure from A must not open/overwrite the newer generation.
+        assert!(!cb.transport_record_failure_lease("p0", lease_a));
+        assert_eq!(cb.transport_state("p0"), BreakerState::HalfOpen);
+        // Probe B still valid: closes the circuit.
+        assert!(cb.transport_record_success_lease("p0", lease_b));
+        assert_eq!(cb.transport_state("p0"), BreakerState::Closed);
+        // Cancellation of A must not remove B's (already-consumed) state or
+        // affect anything after B finalized.
+        cb.transport_cancel_lease("p0", lease_a);
+        cb.transport_cancel_lease("p0", lease_b); // idempotent double-release
+    }
+
+    #[test]
+    fn open_past_two_cooldowns_still_requires_half_open() {
+        use std::sync::Arc;
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            proxy_failure_cooldown_secs: 0,
+            half_open_max_probes: 1,
+            retry_after_max_secs: 300,
+            ..cfg()
+        }));
+        cb.transport_record_failure("p0");
+        std::thread::sleep(Duration::from_millis(5));
+        // First cooldown expiry -> half-open probe.
+        let lease1 = cb.transport_reserve_lease("p0").expect("probe 1");
+        cb.transport_cancel_lease("p0", lease1);
+        std::thread::sleep(Duration::from_millis(5));
+        // Second cooldown expiry -> must still be half-open probe, not closed.
+        let lease2 = cb.transport_reserve_lease("p0").expect("probe 2");
+        assert_eq!(cb.transport_state("p0"), BreakerState::HalfOpen);
+        cb.transport_cancel_lease("p0", lease2);
+        // Without a successful probe the breaker must not be Closed.
+        assert_ne!(cb.transport_state("p0"), BreakerState::Closed);
+    }
+
+    #[test]
+    fn retain_models_keeps_leased_entry_and_drops_when_lease_ends() {
+        use std::sync::Arc;
+        let cb = Arc::new(CircuitBreaker::new(cfg()));
+        // A model with an active lease that is no longer in the catalog.
+        let lease = cb.model_reserve_lease("removed-model").expect("lease");
+        let mut active = HashSet::new();
+        active.insert("kept-model".to_string());
+        // Entry must survive cleanup while the lease is active.
+        cb.retain_models(&active);
+        assert_eq!(cb.model_state("removed-model"), BreakerState::Closed);
+        // End the lease; next cleanup drops the entry.
+        cb.model_cancel_lease("removed-model", lease);
+        cb.retain_models(&active);
+        // state helper reports Closed for missing entries; verify map dropped
+        // by checking a fresh reserve starts generation at 0 (no stale entry).
+        let lease2 = cb.model_reserve_lease("removed-model").expect("fresh");
+        assert_eq!(cb.generation_model("removed-model"), 0);
+        cb.model_cancel_lease("removed-model", lease2);
+    }
+
+    #[test]
+    fn model_map_bounded_under_arbitrary_keys() {
+        use std::sync::Arc;
+        let cb = Arc::new(CircuitBreaker::new(cfg()));
+        for i in 0..500 {
+            let id = format!("model-{i}");
+            let _ = cb.model_reserve_guard(&id); // dropped immediately
+        }
+        let active = HashSet::new();
+        cb.retain_models(&active);
+        let map = cb.model.lock().unwrap();
+        assert!(
+            map.len() <= 1,
+            "cleanup must bound model map size, got {}",
+            map.len()
         );
     }
 

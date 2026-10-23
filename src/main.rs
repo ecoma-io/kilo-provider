@@ -304,6 +304,17 @@ async fn do_refresh(
         match res {
             Ok(Ok(models)) => {
                 catalog.replace(models);
+                // Sync model breaker state with the new catalog: entries for
+                // models no longer present are dropped once they hold no
+                // active lease (retain_models keeps entries with leases).
+                if let Some(snap) = catalog.current() {
+                    let active: HashSet<String> = snap
+                        .models
+                        .iter()
+                        .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                        .collect();
+                    cb.retain_models(&active);
+                }
                 if let Some(g) = tg.take() {
                     let mut g = g;
                     g.record_success();

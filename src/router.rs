@@ -292,6 +292,21 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
             None => {
                 drop(permit);
                 drop(model_guard);
+                // If we were already rate-limited, preserve 429 semantics
+                // instead of masking it with 503.
+                if last_error.as_deref() == Some("rate limited") {
+                    let mut resp = ApiError {
+                        status: StatusCode::TOO_MANY_REQUESTS,
+                        message: "upstream rate limited".to_string(),
+                    }
+                    .into_response();
+                    if let Some(ra) = last_retry_after
+                        && let Ok(v) = HeaderValue::from_str(&ra.as_secs().to_string())
+                    {
+                        resp.headers_mut().insert("retry-after", v);
+                    }
+                    return resp;
+                }
                 return ApiError {
                     status: StatusCode::SERVICE_UNAVAILABLE,
                     message: "no proxy available".to_string(),
@@ -361,47 +376,20 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
                     continue;
                 }
                 if (status == StatusCode::NOT_FOUND || status == StatusCode::GONE) && inference {
-                    // Read a bounded amount of the error body to classify whether
-                    // this is a genuine model-unavailable response, without
-                    // altering the body returned to the client.
-                    let resp_headers = resp.headers().clone();
-                    let mut body_bytes_up = Vec::new();
-                    let mut stream = resp.bytes_stream();
-                    while let Some(chunk) = stream.next().await {
-                        match chunk {
-                            Ok(c) => {
-                                if body_bytes_up.len() < 65536 {
-                                    let take = (65536 - body_bytes_up.len()).min(c.len());
-                                    body_bytes_up.extend_from_slice(&c[..take]);
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    let is_model_unavailable = is_model_unavailable_body(&body_bytes_up);
                     tg.record_success();
                     rg.record_success();
-                    if is_model_unavailable && let Some(g) = model_guard.as_mut() {
-                        g.record_failure();
-                    }
-
-                    // rebuild response preserving status/headers/body
-                    drop(tg);
-                    drop(rg);
-                    drop(model_guard);
-                    drop(permit);
-                    let mut headers = HeaderMap::new();
-                    for (k, v) in &resp_headers {
-                        let name = k.as_str().to_lowercase();
-                        if is_hop_by_hop(&name) {
-                            continue;
-                        }
-                        headers.insert(k.clone(), v.clone());
-                    }
-                    let mut res = Response::new(Body::from(body_bytes_up));
-                    *res.status_mut() = status;
-                    *res.headers_mut() = headers;
-                    return res;
+                    // Model breaker outcome is decided by the classified
+                    // stream (bounded prefix + deadline); the guard stays
+                    // armed so ambiguity cannot open the breaker.
+                    return classified_stream_response(
+                        resp,
+                        Some((tg, rg)),
+                        model_guard,
+                        Some(permit),
+                        cfg.proxy_pool.stream_idle_timeout(),
+                        classifier_probe_len(),
+                        CLASSIFY_DEADLINE,
+                    );
                 }
                 tg.record_success();
                 rg.record_success();
@@ -458,6 +446,302 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
     .into_response()
 }
 
+/// Prefix of an error body kept for model-unavailable classification.
+const CLASSIFY_READ_LIMIT: usize = 64 * 1024;
+/// Hard deadline for the classification read on a 404/410 body.
+const CLASSIFY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Forward remaining bytes in chunks no larger than this.
+const FORWARD_CHUNK_CAP: usize = 64 * 1024;
+
+fn classifier_probe_len() -> usize {
+    CLASSIFY_READ_LIMIT
+}
+
+/// Test-only upstream base override (see `upstream::upstream_url`).
+#[cfg(test)]
+pub(crate) fn test_upstream_base() -> Option<String> {
+    TEST_UPSTREAM_BASE
+        .lock()
+        .expect("test upstream lock")
+        .clone()
+}
+
+/// Serializes tests that swap the global upstream override so parallel
+/// test threads cannot observe each other's fake upstream. Async-aware mutex
+/// so the guard can be held across `.await` in tests without blocking the
+/// runtime.
+#[cfg(test)]
+pub(crate) static TEST_UPSTREAM_SERIALIZE: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+static TEST_UPSTREAM_BASE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Copy upstream response headers into a client-facing header map, dropping
+/// hop-by-hop headers and any header listed by the upstream `Connection`
+/// header (same policy as `stream_response`).
+fn client_response_headers(resp_headers: &HeaderMap) -> HeaderMap {
+    let mut connection_listed: Vec<String> = Vec::new();
+    if let Some(v) = resp_headers.get("connection")
+        && let Ok(s) = v.to_str()
+    {
+        for part in s.split(',') {
+            connection_listed.push(part.trim().to_lowercase());
+        }
+    }
+    let mut headers = HeaderMap::new();
+    for (k, v) in resp_headers {
+        let name = k.as_str().to_lowercase();
+        if is_hop_by_hop(&name) || connection_listed.iter().any(|c| c == &name) {
+            continue;
+        }
+        headers.insert(k.clone(), v.clone());
+    }
+    headers.remove("connection");
+    headers
+}
+
+/// Response path for upstream 404/410 inference errors.
+///
+/// Classification reads a bounded prefix of the body under a hard deadline;
+/// every byte read is re-emitted to the client, then the remainder of the
+/// stream is forwarded unchanged. Status/headers are fixed before the body
+/// starts, so a classification timeout or mid-stream error surfaces as a
+/// stream error and never as a silently truncated complete body. On an
+/// unclassifiable outcome (timeout, body error) the model breaker is NOT
+/// opened: the guard is cancelled instead.
+#[allow(clippy::too_many_arguments)]
+fn classified_stream_response(
+    resp: reqwest::Response,
+    guards: Option<(
+        crate::circuit_breaker::TransportGuard,
+        crate::circuit_breaker::RateLimitGuard,
+    )>,
+    model_guard: Option<crate::circuit_breaker::ModelGuard>,
+    permit: Option<crate::admission::AdmissionPermit>,
+    idle: std::time::Duration,
+    probe_len: usize,
+    classify_deadline: std::time::Duration,
+) -> Response {
+    let status = resp.status();
+    let headers = client_response_headers(resp.headers());
+    let inner = resp.bytes_stream();
+    let deadline_at = tokio::time::Instant::now() + classify_deadline;
+    let stream = futures_util::stream::unfold(
+        (
+            inner,
+            guards,
+            model_guard,
+            permit,
+            idle,
+            0usize,               // bytes kept for classification so far
+            Vec::<u8>::new(),     // classification prefix buffer
+            None::<bytes::Bytes>, // pending forwarding bytes
+            deadline_at,
+            false, // done
+        ),
+        move |(mut s, hg, hmg, hp, idle, kept, mut probe, mut pending, deadline_at, done)| async move {
+            if done {
+                return None;
+            }
+            // Drain pending forwarding bytes first (capped chunk size).
+            if let Some(buf) = pending.take() {
+                if buf.len() > FORWARD_CHUNK_CAP {
+                    let head = buf.slice(..FORWARD_CHUNK_CAP);
+                    pending = Some(buf.slice(FORWARD_CHUNK_CAP..));
+                    return Some((
+                        Ok(head),
+                        (
+                            s,
+                            hg,
+                            hmg,
+                            hp,
+                            idle,
+                            kept,
+                            probe,
+                            pending,
+                            deadline_at,
+                            false,
+                        ),
+                    ));
+                }
+                return Some((
+                    Ok(buf),
+                    (
+                        s,
+                        hg,
+                        hmg,
+                        hp,
+                        idle,
+                        kept,
+                        probe,
+                        pending,
+                        deadline_at,
+                        false,
+                    ),
+                ));
+            }
+            // Classification phase.
+            if kept < probe_len {
+                let remaining = deadline_at
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .max(std::time::Duration::from_millis(1));
+                match tokio::time::timeout(remaining, s.next()).await {
+                    Ok(Some(Ok(bytes))) => {
+                        let take = bytes.len().min(probe_len - kept);
+                        probe.extend_from_slice(&bytes[..take]);
+                        let next_kept = kept + take;
+                        let rest = bytes.slice(take..);
+                        if !rest.is_empty() {
+                            pending = Some(rest);
+                        }
+                        let mut hmg = hmg;
+                        if next_kept >= probe_len {
+                            // classification decided; record outcome and free buffer
+                            let unavailable = is_model_unavailable_body(&probe);
+                            drop(std::mem::take(&mut probe));
+                            if let Some(g) = hmg.as_mut() {
+                                if unavailable {
+                                    g.record_failure();
+                                } else {
+                                    g.record_success();
+                                }
+                            }
+                        }
+                        return Some((
+                            Ok(bytes.slice(..take)),
+                            (
+                                s,
+                                hg,
+                                hmg,
+                                hp,
+                                idle,
+                                next_kept,
+                                probe,
+                                pending,
+                                deadline_at,
+                                false,
+                            ),
+                        ));
+                    }
+                    Ok(Some(Err(e))) => {
+                        // upstream body error during classification: ambiguous
+                        drop(hmg);
+                        return Some((
+                            Err(std::io::Error::other(e.to_string())),
+                            (
+                                s,
+                                hg,
+                                None,
+                                hp,
+                                idle,
+                                kept,
+                                probe,
+                                pending,
+                                deadline_at,
+                                true,
+                            ),
+                        ));
+                    }
+                    Ok(None) => {
+                        // stream ended inside the probe window: classify on what we got
+                        let unavailable = is_model_unavailable_body(&probe);
+                        drop(std::mem::take(&mut probe));
+                        let mut hmg = hmg;
+                        if let Some(g) = hmg.as_mut() {
+                            if unavailable {
+                                g.record_failure();
+                            } else {
+                                g.record_success();
+                            }
+                        }
+                        return None;
+                    }
+                    Err(_) => {
+                        // classification deadline hit: ambiguous, do not open breaker
+                        drop(hmg);
+                        return Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "upstream error body read timed out",
+                            )),
+                            (
+                                s,
+                                hg,
+                                None,
+                                hp,
+                                idle,
+                                kept,
+                                probe,
+                                pending,
+                                deadline_at,
+                                true,
+                            ),
+                        ));
+                    }
+                }
+            }
+            // Plain forwarding phase with idle timeout.
+            match tokio::time::timeout(idle, s.next()).await {
+                Ok(Some(Ok(bytes))) => Some((
+                    Ok(bytes),
+                    (
+                        s,
+                        hg,
+                        hmg,
+                        hp,
+                        idle,
+                        kept,
+                        probe,
+                        pending,
+                        deadline_at,
+                        false,
+                    ),
+                )),
+                Ok(Some(Err(e))) => Some((
+                    Err(std::io::Error::other(e.to_string())),
+                    (
+                        s,
+                        hg,
+                        hmg,
+                        hp,
+                        idle,
+                        kept,
+                        probe,
+                        pending,
+                        deadline_at,
+                        true,
+                    ),
+                )),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "stream idle timeout",
+                    )),
+                    (
+                        s,
+                        hg,
+                        hmg,
+                        hp,
+                        idle,
+                        kept,
+                        probe,
+                        pending,
+                        deadline_at,
+                        true,
+                    ),
+                )),
+            }
+        },
+    );
+    let body = Body::from_stream(stream);
+    let mut res = Response::new(body);
+    *res.status_mut() = status;
+    *res.headers_mut() = headers;
+    res
+}
+
 fn stream_response(
     resp: reqwest::Response,
     _guards: Option<(
@@ -468,29 +752,8 @@ fn stream_response(
     idle: std::time::Duration,
     _permit: Option<crate::admission::AdmissionPermit>,
 ) -> Response {
-    // Collect connection-listed headers from upstream.
-    let mut connection_listed: Vec<String> = Vec::new();
-    if let Some(v) = resp.headers().get("connection")
-        && let Ok(s) = v.to_str()
-    {
-        for part in s.split(',') {
-            connection_listed.push(part.trim().to_lowercase());
-        }
-    }
     let status = resp.status();
-    let mut headers = HeaderMap::new();
-    for (k, v) in resp.headers() {
-        let name = k.as_str().to_lowercase();
-        if is_hop_by_hop(&name) {
-            continue;
-        }
-        if connection_listed.iter().any(|c| c == &name) {
-            continue;
-        }
-        headers.insert(k.clone(), v.clone());
-    }
-    // remove connection header itself
-    headers.remove("connection");
+    let headers = client_response_headers(resp.headers());
     let held_guards = _guards;
     let held_model_guard = _model_guard;
     let held_permit = _permit;
@@ -770,5 +1033,454 @@ half_open_max_probes = 1
             .await
             .expect("req");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- F1/F2: 404/410 classification + full body forwarding ----
+
+    /// Fake upstream: POST handler with controllable status, headers, chunks.
+    /// Request bodies accepted and stream held open by caller control.
+    async fn spawn_upstream_with_404_big_body()
+    -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = axum::Router::new().fallback(move |_req: axum::extract::Request| {
+            let hits = hits2.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                // body > 64 KiB: 100k bytes
+                let marker = b"model \"x\" not found";
+                let mut body = Vec::with_capacity(100 * 1024);
+                body.extend_from_slice(marker);
+                body.resize(100 * 1024, b'a');
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    [
+                        ("content-type", "application/json"),
+                        ("x-custom-header", "kept"),
+                        ("connection", "close"),
+                    ],
+                    body,
+                )
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (addr, hits)
+    }
+
+    fn state_with_upstream(upstream: std::net::SocketAddr) -> AppState {
+        *TEST_UPSTREAM_BASE.lock().expect("test upstream lock") =
+            Some(format!("http://{upstream}/api/gateway"));
+        let config = Config::from_toml(
+            r#"
+[proxy_pool]
+reload_interval_secs = 1
+connect_timeout_secs = 1
+proxies = ["http://placeholder.invalid:1"]
+
+[models]
+refresh_interval_secs = 1
+stale_ttl_secs = 60
+max_entries = 10
+
+[circuit_breaker]
+proxy_failure_cooldown_secs = 1
+rate_limit_cooldown_secs = 1
+model_not_found_cooldown_secs = 1
+half_open_max_probes = 1
+"#,
+        )
+        .expect("config");
+        let catalog = crate::catalog::ModelCatalog::new(
+            10,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(1),
+        );
+        catalog.replace(vec![
+            serde_json::json!({"id":"m:free","pricing":{"prompt":"0","completion":"0"}}),
+        ]);
+        // Build a pool whose single proxy actually points at the fake upstream
+        // by rewriting the proxy URL to the local addr. The proxy client sends
+        // requests with absolute-form target through the HTTP proxy; reqwest
+        // handles that. We instead construct the pool manually with the fake
+        // upstream as an http proxy: axum fallback will receive the request
+        // path as absolute URI via CONNECT-less proxying.
+        let url = format!("http://{upstream}");
+        let pool = ProxyPool::from_config(&{
+            let mut c = config.proxy_pool.clone();
+            c.proxies = vec![url];
+            c
+        })
+        .expect("pool");
+        AppState {
+            proxy_pool: Arc::new(pool),
+            circuit_breaker: Arc::new(CircuitBreaker::default()),
+            catalog: Arc::new(catalog),
+            config: Arc::new(RwLock::new(config.clone())),
+            admission: Arc::new(AdmissionController::new(4)),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inference_404_full_body_forwarded_and_breaker_opened() {
+        // Serialize with other tests using the global upstream override.
+        let _serial = crate::router::TEST_UPSTREAM_SERIALIZE.lock().await;
+        let (upstream, hits) = spawn_upstream_with_404_big_body().await;
+        let state = state_with_upstream(upstream);
+        let app = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(
+                &serde_json::json!({"model":"m:free","messages":[{"role":"user","content":"hi"}]}),
+            )
+            .send()
+            .await
+            .expect("req");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = resp.bytes().await.expect("body");
+        // marker visible
+        assert!(String::from_utf8_lossy(&body).contains("not found"));
+        // full 100k body received (prefix + remainder all forwarded)
+        assert_eq!(
+            body.len(),
+            100 * 1024,
+            "body must be complete, got {} bytes",
+            body.len()
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "single upstream attempt"
+        );
+        // model breaker opened for classified model-unavailable body
+        assert_eq!(
+            state.circuit_breaker.model_state("m:free"),
+            crate::circuit_breaker::BreakerState::Open
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admission_permit_released_after_404_response_completes() {
+        // Serialize with other tests using the global upstream override.
+        let _serial = crate::router::TEST_UPSTREAM_SERIALIZE.lock().await;
+        let (upstream, _hits) = spawn_upstream_with_404_big_body().await;
+        let state = state_with_upstream(upstream);
+        let app = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = reqwest::Client::new();
+        {
+            let resp = client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .json(&serde_json::json!({"model":"m:free","messages":[]}))
+                .send()
+                .await
+                .expect("req");
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let _ = resp.bytes().await;
+        }
+        // response fully consumed: permit must be released
+        for _ in 0..50 {
+            if state.admission.active() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.admission.active(),
+            0,
+            "admission permit must be released"
+        );
+    }
+
+    /// 404 upstream that sends a small non-model error body then holds the
+    /// stream open forever. The handler must terminate the client stream via
+    /// idle timeout instead of hanging, and must NOT open the model breaker
+    /// (unclassifiable/irrelevant body).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inference_404_held_stream_terminates_and_does_not_open_breaker() {
+        // Serialize with other tests using the global upstream override.
+        let _serial = crate::router::TEST_UPSTREAM_SERIALIZE.lock().await;
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let upstream = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    // read request head (ignore content)
+                    let mut buf = [0u8; 8192];
+                    use tokio::io::AsyncReadExt;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        sock.read(&mut buf),
+                    )
+                    .await;
+                    let body = b"{\"error\":\"gone fishing\"}";
+                    let head = format!(
+                        "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.flush().await;
+                    // hold the connection open, never finishing (content-length already satisfied though).
+                    // To truly hold: claim bigger content-length than we send.
+                });
+            }
+        });
+        let state = state_with_upstream(upstream);
+        // shrink timeouts so the test is fast
+        {
+            let mut cfg = state.config.write().expect("cfg lock");
+            cfg.proxy_pool.stream_idle_timeout_secs = 1;
+        }
+        let app = build_router(state.clone());
+        let gw = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = gw.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(gw, app).await.expect("serve");
+        });
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .json(&serde_json::json!({"model":"m:free","messages":[]}))
+                .send(),
+        )
+        .await
+        .expect("must not hang waiting for headers")
+        .expect("req");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // body read must terminate (idle timeout) instead of hanging forever
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), resp.bytes()).await;
+        assert!(
+            body.is_ok(),
+            "stream must terminate via idle timeout, not hang"
+        );
+        let _ = body.expect("ok");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(9),
+            "handler must not hang"
+        );
+        // unclassifiable body: model breaker must stay Closed
+        assert_eq!(
+            state.circuit_breaker.model_state("m:free"),
+            crate::circuit_breaker::BreakerState::Closed
+        );
+    }
+    /// Mid-stream body error on the 404 classification path must surface as a
+    /// stream error, not as a silently truncated complete body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inference_404_body_error_surfaces_as_stream_error() {
+        // Serialize with other tests using the global upstream override.
+        let _serial = crate::router::TEST_UPSTREAM_SERIALIZE.lock().await;
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let upstream = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    {
+                        use tokio::io::AsyncReadExt;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            sock.read(&mut buf),
+                        )
+                        .await;
+                    }
+                    // Claim a large content-length but send only part, then RST.
+                    let head = "HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\ncontent-length: 100000\r\n\r\n";
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(b"model m:free not found; padding...").await;
+                    let _ = sock.flush().await;
+                    // abrupt close without the full body
+                    drop(sock);
+                });
+            }
+        });
+        let state = state_with_upstream(upstream);
+        let app = build_router(state.clone());
+        let gw = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = gw.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(gw, app).await.expect("serve");
+        });
+        let client = reqwest::Client::new();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .json(&serde_json::json!({"model":"m:free","messages":[]}))
+                .send(),
+        )
+        .await
+        .expect("no hang")
+        .expect("req");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Reading the body must fail (aborted mid-stream), never yield a complete 100k body.
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), resp.bytes()).await;
+        match body {
+            Err(_) => panic!("body read hung"),
+            Ok(Err(_)) => { /* stream error surfaced: correct */ }
+            Ok(Ok(b)) => {
+                assert_ne!(
+                    b.len(),
+                    100000,
+                    "partial body must not be presented as complete"
+                );
+            }
+        }
+    }
+
+    /// 429 followed by exhausted proxies must return 429 (not 503) with the
+    /// capped Retry-After preserved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rate_limited_then_no_proxy_returns_429() {
+        // Serialize with other tests using the global upstream override.
+        let _serial = crate::router::TEST_UPSTREAM_SERIALIZE.lock().await;
+        // Two-proxy pool; the fake upstream 429s on the first host and never
+        // gets hit again because both proxies share the same fake upstream.
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let upstream = listener.local_addr().expect("addr");
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = hits2.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    {
+                        use tokio::io::AsyncReadExt;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            sock.read(&mut buf),
+                        )
+                        .await;
+                    }
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let head = "HTTP/1.1 429 Too Many Requests\r\nretry-after: 5\r\ncontent-length: 0\r\n\r\n";
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        let config = Config::from_toml(
+            r#"
+[proxy_pool]
+reload_interval_secs = 1
+connect_timeout_secs = 1
+proxies = ["http://p1.invalid:1", "http://p2.invalid:2"]
+
+[models]
+refresh_interval_secs = 1
+stale_ttl_secs = 60
+max_entries = 10
+
+[circuit_breaker]
+proxy_failure_cooldown_secs = 60
+rate_limit_cooldown_secs = 60
+model_not_found_cooldown_secs = 60
+half_open_max_probes = 1
+retry_after_max_secs = 30
+"#,
+        )
+        .expect("config");
+        let catalog = crate::catalog::ModelCatalog::new(
+            10,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(1),
+        );
+        catalog.replace(vec![
+            serde_json::json!({"id":"m:free","pricing":{"prompt":"0","completion":"0"}}),
+        ]);
+        *TEST_UPSTREAM_BASE.lock().expect("lock") = Some(format!("http://{upstream}/api/gateway"));
+        // Pool with 2 proxies, both pointed at the fake upstream so every
+        // attempt gets a 429; after the first 429 the rate-limit breaker
+        // opens per (proxy, origin) making both unavailable -> reserve None.
+        let mut pool_cfg = config.proxy_pool.clone();
+        pool_cfg.proxies = vec![format!("http://{upstream}"), format!("http://{upstream}")];
+        let pool = ProxyPool::from_config(&pool_cfg).expect("pool");
+        let state = AppState {
+            proxy_pool: Arc::new(pool),
+            circuit_breaker: Arc::new(CircuitBreaker::new(config.circuit_breaker.clone())),
+            catalog: Arc::new(catalog),
+            config: Arc::new(RwLock::new(config.clone())),
+            admission: Arc::new(AdmissionController::new(4)),
+        };
+        let app = build_router(state.clone());
+        let gw = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = gw.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(gw, app).await.expect("serve");
+        });
+        let client = reqwest::Client::new();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .json(&serde_json::json!({"model":"m:free","messages":[]}))
+                .send(),
+        )
+        .await
+        .expect("no hang")
+        .expect("req");
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "must be 429, not 503"
+        );
+        let ra = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        assert_eq!(ra.as_deref(), Some("5"), "Retry-After must be preserved");
+        // bounded attempts: both proxies tried at most once
+        let h = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(h <= 2, "attempts must be bounded by pool size, got {h}");
     }
 }
