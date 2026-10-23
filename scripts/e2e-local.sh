@@ -18,19 +18,19 @@ echo "Declared proxies: $declared"
 export PORT CONFIG_PATH
 echo "Declared proxies: $declared"
 
-# Probe each proxy with bounded concurrency, redacted output
+# Probe each proxy with bounded parallelism (max 4 concurrent). Credentials are
+# never echoed; only aggregate counts and redacted failure codes are printed.
 probe_one() {
   local p="$1"
-  code=$(curl -sS -m 10 -o /dev/null -w "%{http_code}" --proxy "$p" https://api.kilo.ai/api/gateway/models 2>/dev/null || echo "000")
+  code=$(printf 'proxy = "%s"\n' "$p" | curl -sS -m 10 --config - -o /dev/null -w "%{http_code}" https://api.kilo.ai/api/gateway/models 2>/dev/null || echo "000")
   if [[ "$code" == "200" ]]; then echo OK; else echo "FAIL:$code"; fi
 }
 export -f probe_one
 
-ok=0; fail=0
-while IFS= read -r p; do
-  res=$(probe_one "$p")
-  if [[ "$res" == "OK" ]]; then ok=$((ok+1)); else fail=$((fail+1)); echo "proxy probe failed (${res})"; fi
-done < <(python3 -c 'import tomllib,sys; d=tomllib.load(open(sys.argv[1],"rb")); [print(x) for x in d["proxy_pool"]["proxies"]]' "$CONFIG_PATH")
+probe_results="$(python3 -c 'import tomllib,sys; d=tomllib.load(open(sys.argv[1],"rb")); [print(x) for x in d["proxy_pool"]["proxies"]]' "$CONFIG_PATH" | xargs -r -n1 -P4 bash -c 'probe_one "$@"' _)"
+ok=$(printf '%s\n' "$probe_results" | grep -c '^OK$' || true)
+fail=$(printf '%s\n' "$probe_results" | grep -c '^FAIL:' || true)
+printf '%s\n' "$probe_results" | grep '^FAIL:' | sed 's/^/proxy probe failed (/' | sed 's/$/)/' || true
 echo "Proxy probe summary: declared=$declared success=$ok failed=$fail"
 if [[ "$ok" -eq 0 ]]; then
   echo "ERROR: no usable proxy" >&2
@@ -86,6 +86,14 @@ if grep -q '^data:' "$tmp_sse"; then
   echo "SSE: received streamed chunks"
 else
   echo "ERROR: SSE no chunks" >&2; exit 1
+fi
+if grep -q 'data: \[DONE\]' "$tmp_sse" || grep -q '"finish_reason"' "$tmp_sse"; then
+  echo "SSE: terminal completion observed"
+else
+  echo "ERROR: SSE missing terminal completion" >&2; exit 1
+fi
+if grep -qi 'error' "$tmp_sse"; then
+  echo "ERROR: SSE contained error payload" >&2; exit 1
 fi
 rm -f "$tmp_sse"
 echo "E2E completed."

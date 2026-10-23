@@ -86,9 +86,27 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn models_handler(State(state): State<AppState>) -> impl IntoResponse {
     if let Some(snap) = state.catalog.current() {
+        // Normalize to the OpenAI-compatible /v1/models schema: every entry
+        // must carry object="model", created and owned_by even when the
+        // upstream omits them.
+        let data: Vec<Value> = snap
+            .models
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                if let Some(obj) = m.as_object_mut() {
+                    obj.entry("object".to_string())
+                        .or_insert_with(|| json!("model"));
+                    obj.entry("created".to_string()).or_insert_with(|| json!(0));
+                    obj.entry("owned_by".to_string())
+                        .or_insert_with(|| json!("kilo"));
+                }
+                m
+            })
+            .collect();
         (
             StatusCode::OK,
-            Json(json!({ "object": "list", "data": snap.models })),
+            Json(json!({ "object": "list", "data": data })),
         )
             .into_response()
     } else {
@@ -370,15 +388,16 @@ fn stream_response(
     }
     // remove connection header itself
     headers.remove("connection");
-    let stream = resp
-        .bytes_stream()
-        .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
+    let held_guards = _guards;
+    let held_model_guard = _model_guard;
+    let stream = resp.bytes_stream().map(move |r| {
+        let _ = (&held_guards, &held_model_guard);
+        r.map_err(|e| std::io::Error::other(e.to_string()))
+    });
     let body = Body::from_stream(stream);
     let mut res = Response::new(body);
     *res.status_mut() = status;
     *res.headers_mut() = headers;
-    drop(_guards);
-    drop(_model_guard);
     res
 }
 

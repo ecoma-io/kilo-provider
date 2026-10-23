@@ -11,7 +11,7 @@ on:
         required: true
         type: string
       source_sha:
-        description: "Source commit SHA to release (defaults to the checked-out SHA)"
+        description: "Source commit SHA to release (full 40-character SHA; defaults to the checked-out SHA)"
         required: false
         type: string
 
@@ -34,7 +34,7 @@ jobs:
     outputs:
       tag_name: ${{ steps.tag.outputs.tag_name }}
       version: ${{ steps.tag.outputs.version }}
-      release_sha: ${{ steps.sha.outputs.sha }}
+      release_sha: ${{ steps.commit.outputs.sha }}
       release_created: ${{ steps.done.outputs.created }}
     steps:
       - name: Checkout source
@@ -42,75 +42,134 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ github.ref_name }}
-          persist-credentials: false
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Resolve source SHA
         id: sha
         shell: bash
+        env:
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [ -n "${{ inputs.source_sha }}" ]; then
-            sha="${{ inputs.source_sha }}"
+          if [ -n "${INPUT_SOURCE_SHA:-}" ]; then
+            sha="${INPUT_SOURCE_SHA}"
           else
-            sha="${{ github.sha }}"
+            sha="${GITHUB_SHA}"
           fi
-          # validate full sha
-          if ! [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]]; then
-            echo "::error::invalid source SHA: $sha"; exit 1
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::source SHA must be a full 40-character lowercase hex SHA: $sha"; exit 1
+          fi
+          # Verify the selected source SHA is reachable in this checkout.
+          if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+            echo "::error::source SHA not found in repository: $sha"; exit 1
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Validate version
         id: ver
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          v="${{ inputs.version }}"
+          v="${INPUT_VERSION}"
           v="${v#v}"
           if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::invalid version: $v"; exit 1
           fi
-          # ensure tag does not already exist
+          if [ "$v" = "0.1.0" ]; then
+            echo "::error::v0.1.0 must never be moved, deleted or overwritten"; exit 1
+          fi
+          # ensure tag does not already exist locally or remotely
           if git rev-parse "v$v" >/dev/null 2>&1; then
-            echo "::error::tag v$v already exists"; exit 1
+            echo "::error::tag v$v already exists locally"; exit 1
           fi
           if git ls-remote --tags origin "refs/tags/v$v" | grep -q .; then
             echo "::error::remote tag v$v already exists"; exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
+      - name: Checkout selected source SHA
+        id: checkout-sha
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git checkout --detach "$SOURCE_SHA"
+          echo "checked_out=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Sync version metadata
         shell: bash
         env:
           VERSION: ${{ steps.ver.outputs.version }}
+          SOURCE_SHA: ${{ steps.sha.outputs.sha }}
         run: |
           set -euo pipefail
           # Update Cargo.toml version
           sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
-          # Update manifest
-python3 -c "import json; p='.release-please-manifest.json'; d=json.load(open(p)); d['.']=$VERSION; open(p,'w').write(json.dumps(d,indent=2)+'\n')"
-          cargo update -p kilo-provider 2>/dev/null || true
+          # Update manifest using environment variable (never interpolate into source).
+          python3 -c 'import json,os; v=os.environ["VERSION"]; p=".release-please-manifest.json"; d=json.load(open(p)); d["."]=v; open(p,"w").write(json.dumps(d,indent=2)+"\n")'
+          # Keep Cargo.lock in sync with the crate version.
+          cargo update -p kilo-provider --offline 2>/dev/null || cargo update -p kilo-provider 2>/dev/null || true
 
-      - name: Verify tag not existing & create tag
-        id: tag
+      - name: Validate release metadata
+        id: validate-metadata
         shell: bash
         env:
           VERSION: ${{ steps.ver.outputs.version }}
-          SHA: ${{ steps.sha.outputs.sha }}
+          SOURCE_SHA: ${{ steps.sha.outputs.sha }}
+          CHECKED_SHA: ${{ steps.checkout-sha.outputs.checked_out }}
+          TAG_NAME: v${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="$VERSION" \
+          SOURCE_SHA="$SOURCE_SHA" \
+          CHECKED_SHA="$CHECKED_SHA" \
+          TAG_NAME="$TAG_NAME" \
+          bash scripts/validate-release-metadata.sh
+
+      - name: Commit metadata changes if needed
+        id: commit
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "v$VERSION" "$SHA"
-          git push origin "v$VERSION"
-          echo "tag_name=v$VERSION" >> "$GITHUB_OUTPUT"
+          git add Cargo.toml Cargo.lock .release-please-manifest.json
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "chore: release v${VERSION} metadata"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        id: tag
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          RELEASE_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          git tag "$tag" "$RELEASE_SHA"
+          git push origin "$tag"
+          echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           name: v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ steps.commit.outputs.sha }}
           generate_release_notes: true
 
       - name: Mark done
@@ -152,16 +211,24 @@ python3 -c "import json; p='.release-please-manifest.json'; d=json.load(open(p))
       - name: Determine release params
         id: params
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BOOTSTRAP_TAG: ${{ needs.bootstrap-release.outputs.tag_name }}
+          BOOTSTRAP_VERSION: ${{ needs.bootstrap-release.outputs.version }}
+          BOOTSTRAP_SHA: ${{ needs.bootstrap-release.outputs.release_sha }}
+          RELEASE_PLEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          RELEASE_PLEASE_VERSION: ${{ needs.release-please.outputs.version }}
+          RELEASE_PLEASE_SHA: ${{ needs.release-please.outputs.release_sha }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag_name=${{ needs.bootstrap-release.outputs.tag_name }}" >> "$GITHUB_OUTPUT"
-            echo "version=${{ needs.bootstrap-release.outputs.version }}" >> "$GITHUB_OUTPUT"
-            echo "sha=${{ needs.bootstrap-release.outputs.release_sha }}" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "tag_name=${BOOTSTRAP_TAG}" >> "$GITHUB_OUTPUT"
+            echo "version=${BOOTSTRAP_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "sha=${BOOTSTRAP_SHA}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag_name=${{ needs.release-please.outputs.tag_name }}" >> "$GITHUB_OUTPUT"
-            echo "version=${{ needs.release-please.outputs.version }}" >> "$GITHUB_OUTPUT"
-            echo "sha=${{ needs.release-please.outputs.release_sha }}" >> "$GITHUB_OUTPUT"
+            echo "tag_name=${RELEASE_PLEASE_TAG}" >> "$GITHUB_OUTPUT"
+            echo "version=${RELEASE_PLEASE_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "sha=${RELEASE_PLEASE_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Check out release tag
@@ -170,6 +237,22 @@ python3 -c "import json; p='.release-please-manifest.json'; d=json.load(open(p))
         with:
           ref: ${{ steps.params.outputs.tag_name }}
           persist-credentials: false
+
+      - name: Validate release metadata
+        id: validate-metadata
+        shell: bash
+        env:
+          VERSION: ${{ steps.params.outputs.version }}
+          SOURCE_SHA: ${{ steps.params.outputs.sha }}
+          CHECKED_SHA: ${{ steps.checkout.outputs.commit }}
+          TAG_NAME: ${{ steps.params.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="$VERSION" \
+          SOURCE_SHA="$SOURCE_SHA" \
+          CHECKED_SHA="$CHECKED_SHA" \
+          TAG_NAME="$TAG_NAME" \
+          bash scripts/validate-release-metadata.sh
 
       - name: Validate image refs
         id: validate
@@ -180,21 +263,18 @@ python3 -c "import json; p='.release-please-manifest.json'; d=json.load(open(p))
           RELEASE_VERSION: ${{ steps.params.outputs.version }}
           RELEASE_SHA: ${{ steps.checkout.outputs.commit }}
           CHECKED_SHA: ${{ steps.params.outputs.sha }}
+          TAGS_OUTPUT: ""
         run: |
           set -euo pipefail
           repo="${REPOSITORY#*/}"
           image="ghcr.io/${REPOSITORY_OWNER,,}/${repo,,}"
-          # ensure lowercase
           if [ "$image" != "$(echo "$image" | tr '[:upper:]' '[:lower:]')" ]; then
             echo "::error::image ref not lowercase"; exit 1
           fi
-          # tags from metadata
           version="${RELEASE_VERSION#v}"
-          # validate checked out sha equals params sha
           if [ "$RELEASE_SHA" != "$CHECKED_SHA" ]; then
             echo "::error::checked-out SHA $RELEASE_SHA != release SHA $CHECKED_SHA"; exit 1
           fi
-          # build tag list
           NL=$'\n'
           tags="$image:$version"
           if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -207,27 +287,26 @@ python3 -c "import json; p='.release-please-manifest.json'; d=json.load(open(p))
             tags="${tags}${NL}$image:latest"
           fi
           tags="${tags}${NL}$image:sha-${RELEASE_SHA:0:7}"
-          # validate each tag
+          # Validate each fully qualified GHCR tag.
           while IFS= read -r ref; do
             [ -z "$ref" ] && continue
             if [[ "$ref" != ghcr.io/* ]]; then
-              echo "::error::tag not GHCR: $ref"; exit 1
+              echo "::error::tag not fully qualified GHCR ref: $ref"; exit 1
             fi
             if [[ "$ref" == docker.io/* ]]; then
               echo "::error::tag points to Docker Hub: $ref"; exit 1
             fi
-            # extract tag part after last colon for validation
             tagpart="${ref##*:}"
             if [ -z "$tagpart" ]; then
-              echo "::error::empty tag"; exit 1
+              echo "::error::empty tag: $ref"; exit 1
             fi
             if [[ "$tagpart" =~ [^a-zA-Z0-9._-] ]]; then
               echo "::error::invalid tag chars: $tagpart"; exit 1
             fi
           done <<< "$tags"
-          # verify no bare tags
-          if echo "$tags" | grep -qE '^(0|[0-9]+\.[0-9]+\.[0-9]+|latest|sha-[a-f0-9]+)$'; then
-            : # bare names are okay as suffixes only; full ref has image prefix
+          # Validate tag uniqueness.
+          if [ -n "$(printf '%s\n' $tags | sort | uniq -d)" ]; then
+            echo "::error::duplicate GHCR tags generated"; exit 1
           fi
           {
             echo "image=$image"
