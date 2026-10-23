@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::info;
 
+use kilo_provider::admission::AdmissionController;
 use kilo_provider::catalog::ModelCatalog;
 use kilo_provider::circuit_breaker::CircuitBreaker;
 use kilo_provider::config::Config;
@@ -43,9 +44,9 @@ fn run() -> Result<(), AppError> {
         Duration::from_secs(config.models.stale_ttl_secs),
         Duration::from_secs(config.models.refresh_interval_secs),
     ));
-    let admission = Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(
+    let admission = Arc::new(AdmissionController::new(
         config.proxy_pool.max_concurrent_requests,
-    ))));
+    ));
     let _upstream_base = UPSTREAM_BASE_URL;
     let _ = UPSTREAM_ORIGIN;
 
@@ -111,12 +112,8 @@ fn run() -> Result<(), AppError> {
                             Ok(()) => {
                                 let pool_changed = old_fp != new_fp;
                                 cb_clone.update_config(&new_cfg.circuit_breaker);
-                                // update admission semaphore capacity
-                                if adm_clone.read().unwrap().available_permits() != new_cfg.proxy_pool.max_concurrent_requests {
-                                    *adm_clone.write().unwrap() = Arc::new(tokio::sync::Semaphore::new(
-                                        new_cfg.proxy_pool.max_concurrent_requests,
-                                    ));
-                                }
+                                // update admission capacity safely (no controller replacement)
+                                adm_clone.update_capacity(new_cfg.proxy_pool.max_concurrent_requests);
                                 // cleanup breaker state for removed proxies (safe: keep active+probes)
                                 {
                                     let active: HashSet<String> = pool_clone
@@ -132,6 +129,13 @@ fn run() -> Result<(), AppError> {
                                     Duration::from_secs(new_cfg.models.refresh_interval_secs),
                                     new_cfg.models.max_entries,
                                 );
+                                // retain model breakers for active catalog models + active leases
+                                if let Some(snap) = cat_clone.current() {
+                                    let active: HashSet<String> = snap.models.iter()
+                                        .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                                        .collect();
+                                    cb_clone.retain_models(&active);
+                                }
                                 *cfg_clone.write().unwrap() = new_cfg;
                                 if !pool_changed {
                                     // breaker state already preserved because proxy ids stable
@@ -257,70 +261,122 @@ async fn do_refresh(
     pool: &ProxyPool,
     cb: &std::sync::Arc<CircuitBreaker>,
     catalog: &ModelCatalog,
-    _config: &Config,
+    config: &Config,
 ) {
     use kilo_provider::catalog::CatalogFetchError;
     use kilo_provider::catalog::fetch_catalog;
+    let _single_flight = catalog.refresh_lock.lock().await;
     let origin = UPSTREAM_ORIGIN.to_string();
     let base = reqwest::Url::parse(UPSTREAM_BASE_URL).unwrap();
     let max_attempts = pool.len().max(1);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let header_timeout = Duration::from_secs(config.proxy_pool.response_header_timeout_secs);
+    let retry_after_max = Duration::from_secs(config.circuit_breaker.retry_after_max_secs.max(1));
     let mut last_err: Option<String> = None;
+    let mut stop = false;
     for _ in 0..max_attempts {
+        if stop {
+            break;
+        }
         if tokio::time::Instant::now() >= deadline {
             break;
         }
         let reserved = pool.reserve_guarded(cb, &origin);
-        let (proxy, mut tg, mut rg) = match reserved {
+        let (proxy, tg, rg) = match reserved {
             Some(r) => r,
             None => {
-                // no proxy available right now
                 catalog.mark_error("no proxy available for catalog refresh".to_string());
                 return;
             }
         };
-        let pid = proxy.id.clone();
         let http = proxy.client().clone();
-        match fetch_catalog(&http, &base, None).await {
-            Ok(models) => {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let attempt_timeout = remaining
+            .min(Duration::from_secs(15))
+            .max(Duration::from_secs(1));
+        let res = tokio::time::timeout(
+            attempt_timeout,
+            fetch_catalog(&http, &base, header_timeout, 8 * 1024 * 1024),
+        )
+        .await;
+        let mut tg = Some(tg);
+        let mut rg = Some(rg);
+        match res {
+            Ok(Ok(models)) => {
                 catalog.replace(models);
-                tg.record_success();
-                rg.record_success();
-                // also reset rate limit? record_success does
+                if let Some(g) = tg.take() {
+                    let mut g = g;
+                    g.record_success();
+                }
+                if let Some(g) = rg.take() {
+                    let mut g = g;
+                    g.record_success();
+                }
                 return;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 last_err = Some(e.to_string());
                 match e {
                     CatalogFetchError::Connect(_) => {
-                        cb.transport_record_failure_outcome(&pid, tg.lease_id());
-                        rg.record_success(); // cancel rate limit reservation? keep
-                        // Actually release rate limit probe
-                        // mark not quarantined for rate limit
+                        if let Some(g) = tg.take() {
+                            let mut g = g;
+                            g.record_failure();
+                        }
+                        // rg drop releases without state change
+                    }
+                    CatalogFetchError::HeaderTimeout => {
+                        // ambiguous: drop both (cancel)
+                    }
+                    CatalogFetchError::BodyRead(_) => {
+                        // ambiguous: drop both
                     }
                     CatalogFetchError::RateLimited(ra) => {
-                        let capped = ra; // already capped in cb? pass through
-                        cb.rate_limit_record_failure_outcome(&pid, &origin, rg.lease_id(), capped);
-                        tg.record_success();
+                        let mut capped = ra.unwrap_or(Duration::from_secs(
+                            config.circuit_breaker.rate_limit_cooldown_secs,
+                        ));
+                        if capped > retry_after_max {
+                            capped = retry_after_max;
+                        }
+                        if let Some(g) = rg.take() {
+                            let mut g = g;
+                            g.record_failure(Some(capped));
+                        }
+                        if let Some(g) = tg.take() {
+                            let mut g = g;
+                            g.record_success();
+                        }
                     }
                     CatalogFetchError::Http(_, _) => {
-                        // application error: do not quarantine transport
-                        tg.record_success();
-                        rg.record_success();
+                        if let Some(g) = tg.take() {
+                            let mut g = g;
+                            g.record_success();
+                        }
+                        if let Some(g) = rg.take() {
+                            let mut g = g;
+                            g.record_success();
+                        }
+                        stop = true;
                     }
                     CatalogFetchError::Schema(_) => {
-                        tg.record_success();
-                        rg.record_success();
+                        if let Some(g) = tg.take() {
+                            let mut g = g;
+                            g.record_success();
+                        }
+                        if let Some(g) = rg.take() {
+                            let mut g = g;
+                            g.record_success();
+                        }
+                        stop = true;
                     }
                 }
-                // cancel guards to release any remaining reservations
-                // guards drop at end of iteration? We'll drop explicitly
-                drop(tg);
-                drop(rg);
-                // if connect failure, loop to next proxy
-                continue;
+            }
+            Err(_) => {
+                last_err = Some("catalog attempt timeout".to_string());
             }
         }
+        // drops remaining guards
+        drop(tg);
+        drop(rg);
     }
     if let Some(e) = last_err {
         catalog.mark_error(e);

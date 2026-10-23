@@ -10,6 +10,7 @@ use bytes::Bytes;
 use futures_util::stream::StreamExt;
 use serde_json::{Value, json};
 
+use crate::admission::AdmissionController;
 use crate::catalog::ModelCatalog;
 use crate::circuit_breaker::CircuitBreaker;
 use crate::config::Config;
@@ -22,7 +23,7 @@ pub struct AppState {
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub catalog: Arc<ModelCatalog>,
     pub config: Arc<RwLock<Config>>,
-    pub admission: Arc<RwLock<Arc<tokio::sync::Semaphore>>>,
+    pub admission: Arc<AdmissionController>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -153,10 +154,9 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
 
     let headers = req.headers().clone();
 
-    let sem = state.admission.read().unwrap().clone();
-    let permit = match sem.try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
+    let permit = match state.admission.try_acquire() {
+        Some(p) => p,
+        None => {
             return ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: "too many concurrent requests".to_string(),
@@ -257,16 +257,21 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
 
     // model breaker reserve (once) for inference, with a leak-safe guard so
     // the slot is released even if this request future is cancelled/dropped.
-    let model_guard: Option<crate::circuit_breaker::ModelGuard> = if let Some(mid) = &model_id {
-        match state.circuit_breaker.model_reserve_guard(mid) {
-            Some(g) => Some(g),
-            None => {
-                return ApiError {
-                    status: StatusCode::SERVICE_UNAVAILABLE,
-                    message: "model circuit breaker open".to_string(),
+    let mut model_guard: Option<crate::circuit_breaker::ModelGuard> = if inference {
+        if let Some(mid) = &model_id {
+            match state.circuit_breaker.model_reserve_guard(mid) {
+                Some(g) => Some(g),
+                None => {
+                    drop(permit);
+                    return ApiError {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        message: "model circuit breaker open".to_string(),
+                    }
+                    .into_response();
                 }
-                .into_response();
             }
+        } else {
+            None
         }
     } else {
         None
@@ -275,15 +280,18 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
     let forward_headers = filter_headers(&headers);
 
     let max_attempts = state.proxy_pool.len().max(1);
+    let header_timeout = cfg.proxy_pool.response_header_timeout();
     let mut last_error: Option<String> = None;
     let mut last_retry_after: Option<std::time::Duration> = None;
     for _ in 0..max_attempts {
         let reserved = state
             .proxy_pool
             .reserve_guarded(&state.circuit_breaker, &origin);
-        let (proxy, tg, rg) = match reserved {
+        let (proxy, mut tg, mut rg) = match reserved {
             Some(r) => r,
             None => {
+                drop(permit);
+                drop(model_guard);
                 return ApiError {
                     status: StatusCode::SERVICE_UNAVAILABLE,
                     message: "no proxy available".to_string(),
@@ -291,7 +299,7 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
                 .into_response();
             }
         };
-        let pid = proxy.id.clone();
+        let _pid = proxy.id.clone();
 
         let mut rb = proxy.client().request(method.clone(), &url);
         for (k, v) in &forward_headers {
@@ -301,48 +309,50 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
             rb = rb.body(body_bytes.clone());
         }
 
-        let header_timeout = cfg.proxy_pool.response_header_timeout();
         let send_res = tokio::time::timeout(header_timeout, rb.send()).await;
         match send_res {
             Err(_) => {
-                state.circuit_breaker.transport_cancel(&pid);
-                state.circuit_breaker.rate_limit_cancel(&pid, &origin);
+                // response header timeout: ambiguous, do not retry inference
                 last_error = Some("response header timeout".to_string());
                 drop(tg);
                 drop(rg);
-                continue;
+                break;
             }
             Ok(Err(e)) => {
                 let is_connect = e.is_connect();
                 if is_connect {
-                    state.circuit_breaker.transport_record_failure(&pid);
-                    state.circuit_breaker.rate_limit_cancel(&pid, &origin);
+                    tg.record_failure();
+                    last_error = Some(e.to_string());
+                    drop(tg);
+                    drop(rg);
+                    continue;
                 } else {
-                    state.circuit_breaker.transport_cancel(&pid);
-                    state.circuit_breaker.rate_limit_cancel(&pid, &origin);
-                }
-                last_error = Some(e.to_string());
-                drop(tg);
-                drop(rg);
-                if !is_connect {
+                    drop(tg);
+                    drop(rg);
+                    drop(permit);
+                    drop(model_guard);
                     return ApiError {
                         status: StatusCode::BAD_GATEWAY,
                         message: format!("upstream request failed: {}", e),
                     }
                     .into_response();
                 }
-                continue;
             }
             Ok(Ok(resp)) => {
-                // handle below; bind resp in scope by using a nested block
                 let status = resp.status();
                 if status == StatusCode::TOO_MANY_REQUESTS {
                     let retry_after = parse_retry_after(resp.headers());
-                    state
-                        .circuit_breaker
-                        .rate_limit_record_failure(&pid, &origin, retry_after);
-                    state.circuit_breaker.transport_record_success(&pid);
-                    if let Some(ra) = retry_after {
+                    let capped = retry_after.map(|ra| {
+                        let max = cfg.circuit_breaker.retry_after_max_secs.max(1);
+                        if ra.as_secs() > max {
+                            std::time::Duration::from_secs(max)
+                        } else {
+                            ra
+                        }
+                    });
+                    rg.record_failure(capped);
+                    tg.record_success();
+                    if let Some(ra) = capped {
                         last_retry_after = Some(ra);
                     }
                     last_error = Some("rate limited".to_string());
@@ -351,30 +361,55 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
                     continue;
                 }
                 if (status == StatusCode::NOT_FOUND || status == StatusCode::GONE) && inference {
-                    if let Some(mid) = &model_id {
-                        state.circuit_breaker.model_record_failure(mid);
+                    // Read a bounded amount of the error body to classify whether
+                    // this is a genuine model-unavailable response, without
+                    // altering the body returned to the client.
+                    let resp_headers = resp.headers().clone();
+                    let mut body_bytes_up = Vec::new();
+                    let mut stream = resp.bytes_stream();
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(c) => {
+                                if body_bytes_up.len() < 65536 {
+                                    let take = (65536 - body_bytes_up.len()).min(c.len());
+                                    body_bytes_up.extend_from_slice(&c[..take]);
+                                }
+                            }
+                            Err(_) => break,
+                        }
                     }
-                    state.circuit_breaker.transport_record_success(&pid);
-                    state
-                        .circuit_breaker
-                        .rate_limit_record_success(&pid, &origin);
-                    return stream_response(
-                        resp,
-                        Some((tg, rg)),
-                        model_guard,
-                        cfg.proxy_pool.stream_idle_timeout(),
-                        Some(permit),
-                    );
+                    let is_model_unavailable = is_model_unavailable_body(&body_bytes_up);
+                    tg.record_success();
+                    rg.record_success();
+                    if is_model_unavailable && let Some(g) = model_guard.as_mut() {
+                        g.record_failure();
+                    }
+
+                    // rebuild response preserving status/headers/body
+                    drop(tg);
+                    drop(rg);
+                    drop(model_guard);
+                    drop(permit);
+                    let mut headers = HeaderMap::new();
+                    for (k, v) in &resp_headers {
+                        let name = k.as_str().to_lowercase();
+                        if is_hop_by_hop(&name) {
+                            continue;
+                        }
+                        headers.insert(k.clone(), v.clone());
+                    }
+                    let mut res = Response::new(Body::from(body_bytes_up));
+                    *res.status_mut() = status;
+                    *res.headers_mut() = headers;
+                    return res;
                 }
-                state.circuit_breaker.transport_record_success(&pid);
-                state
-                    .circuit_breaker
-                    .rate_limit_record_success(&pid, &origin);
-                if let Some(mid) = &model_id
-                    && status.is_success()
+                tg.record_success();
+                rg.record_success();
+                if status.is_success()
                     && inference
+                    && let Some(g) = model_guard.as_mut()
                 {
-                    state.circuit_breaker.model_record_success(mid);
+                    g.record_success();
                 }
                 return stream_response(
                     resp,
@@ -400,12 +435,25 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
         }
         return resp;
     }
+    drop(model_guard);
+    drop(permit);
+    let (status, msg) = if last_error.as_deref() == Some("response header timeout") {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream response header timeout".to_string(),
+        )
+    } else {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "upstream request failed: {}",
+                last_error.unwrap_or_else(|| "unknown".to_string())
+            ),
+        )
+    };
     ApiError {
-        status: StatusCode::BAD_GATEWAY,
-        message: format!(
-            "upstream request failed: {}",
-            last_error.unwrap_or_else(|| "unknown".to_string())
-        ),
+        status,
+        message: msg,
     }
     .into_response()
 }
@@ -418,7 +466,7 @@ fn stream_response(
     )>,
     _model_guard: Option<crate::circuit_breaker::ModelGuard>,
     idle: std::time::Duration,
-    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    _permit: Option<crate::admission::AdmissionPermit>,
 ) -> Response {
     // Collect connection-listed headers from upstream.
     let mut connection_listed: Vec<String> = Vec::new();
@@ -538,6 +586,43 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
+fn is_model_unavailable_body(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body).to_lowercase();
+    // Try JSON first.
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(code) = v
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str())
+            && (code == "model_not_found"
+                || code == "model_not_available"
+                || code == "model_does_not_exist")
+        {
+            return true;
+        }
+        if let Some(msg) = v
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            let m = msg.to_lowercase();
+            if m.contains("model")
+                && (m.contains("not found")
+                    || m.contains("does not exist")
+                    || m.contains("not available")
+                    || m.contains("unknown"))
+            {
+                return true;
+            }
+        }
+    }
+    text.contains("model")
+        && (text.contains("not found")
+            || text.contains("does not exist")
+            || text.contains("not available")
+            || text.contains("unknown model"))
+}
+
 fn extract_model(body: &Bytes) -> Option<String> {
     if body.is_empty() {
         return None;
@@ -606,9 +691,9 @@ half_open_max_probes = 1
             circuit_breaker: Arc::new(CircuitBreaker::default()),
             catalog: Arc::new(catalog),
             config: Arc::new(RwLock::new(config.clone())),
-            admission: Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(
+            admission: Arc::new(AdmissionController::new(
                 config.proxy_pool.max_concurrent_requests,
-            )))),
+            )),
         }
     }
 

@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admission;
 pub mod catalog;
 pub mod circuit_breaker;
 pub mod config;

@@ -17,6 +17,7 @@ pub struct ModelCatalog {
     stale_ttl: RwLock<Duration>,
     refresh_interval: RwLock<Duration>,
     state: RwLock<CatalogState>,
+    pub refresh_lock: tokio::sync::Mutex<()>,
 }
 
 struct CatalogState {
@@ -34,6 +35,7 @@ impl ModelCatalog {
                 snapshot: None,
                 last_error: None,
             }),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -211,6 +213,8 @@ fn is_free_model(_id: &str, meta: &Value) -> bool {
 #[derive(Debug, Clone)]
 pub enum CatalogFetchError {
     Connect(String),
+    HeaderTimeout,
+    BodyRead(String),
     RateLimited(Option<std::time::Duration>),
     Http(u16, String),
     Schema(String),
@@ -220,6 +224,8 @@ impl std::fmt::Display for CatalogFetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Connect(m) => write!(f, "connect/transport error: {m}"),
+            Self::HeaderTimeout => write!(f, "response header timeout"),
+            Self::BodyRead(m) => write!(f, "catalog body read failed: {m}"),
             Self::RateLimited(_) => write!(f, "HTTP 429 rate limited"),
             Self::Http(s, m) => write!(f, "HTTP {s}: {m}"),
             Self::Schema(m) => write!(f, "catalog schema error: {m}"),
@@ -263,16 +269,16 @@ fn parse_retry_after(h: &reqwest::header::HeaderMap) -> Option<std::time::Durati
 pub async fn fetch_catalog(
     client: &reqwest::Client,
     base_url: &reqwest::Url,
-    _proxy_url: Option<&str>,
+    header_timeout: std::time::Duration,
+    max_body_bytes: usize,
 ) -> Result<Vec<Value>, CatalogFetchError> {
     let mut url = base_url.clone();
     let base_path = url.path().trim_end_matches('/');
     url.set_path(&format!("{}/models", base_path));
 
-    let resp = client
-        .get(url.clone())
-        .send()
+    let resp = tokio::time::timeout(header_timeout, client.get(url.clone()).send())
         .await
+        .map_err(|_| CatalogFetchError::HeaderTimeout)?
         .map_err(|e| CatalogFetchError::Connect(e.to_string()))?;
     let status = resp.status();
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -285,16 +291,20 @@ pub async fn fetch_catalog(
             format!("catalog fetch failed: HTTP {status}"),
         ));
     }
-    // read bytes with a cap
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| CatalogFetchError::Connect(format!("catalog body read failed: {e}")))?;
-    if bytes.len() > 8 * 1024 * 1024 {
-        return Err(CatalogFetchError::Schema(
-            "catalog response too large".to_string(),
-        ));
+    // bounded streaming read
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| CatalogFetchError::BodyRead(e.to_string()))?;
+        if buf.len() + chunk.len() > max_body_bytes {
+            return Err(CatalogFetchError::Schema(
+                "catalog response too large".to_string(),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
     }
+    let bytes = bytes::Bytes::from(buf);
     let v: Value = serde_json::from_slice(&bytes)
         .map_err(|e| CatalogFetchError::Schema(format!("catalog JSON parse failed: {e}")))?;
     let data = v.get("data").and_then(|d| d.as_array()).ok_or_else(|| {
