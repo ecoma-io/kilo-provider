@@ -157,32 +157,6 @@ impl ProxyPool {
         None
     }
 
-    /// Reserve a proxy for a request: checks + reserves probe slot.
-    pub fn reserve(
-        &self,
-        breaker: &crate::circuit_breaker::CircuitBreaker,
-        origin: &str,
-    ) -> Option<Arc<ProxyClient>> {
-        let snap = self.snapshot();
-        let n = snap.proxies.len();
-        if n == 0 {
-            return None;
-        }
-        let start = self.rr.fetch_add(1, Ordering::Relaxed) % n;
-        for i in 0..n {
-            let p = &snap.proxies[(start + i) % n];
-            // reserve both; if one fails cancel
-            if breaker.transport_reserve(&p.id) {
-                if breaker.rate_limit_reserve(&p.id, origin) {
-                    return Some(p.clone());
-                } else {
-                    breaker.transport_cancel(&p.id);
-                }
-            }
-        }
-        None
-    }
-
     /// Reserve a proxy and return leak-safe guards for both transport and
     /// rate-limit scopes. Guards cancel their reservations on drop, including
     /// when the owning future is cancelled.

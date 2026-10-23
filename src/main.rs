@@ -291,8 +291,11 @@ async fn do_refresh(
         };
         let http = proxy.client().clone();
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // The per-attempt budget must stay >= the inner header timeout so a
+        // header stall surfaces as CatalogFetchError::HeaderTimeout rather
+        // than a generic attempt timeout.
         let attempt_timeout = remaining
-            .min(Duration::from_secs(15))
+            .max(header_timeout + Duration::from_secs(1))
             .max(Duration::from_secs(1));
         let res = tokio::time::timeout(
             attempt_timeout,

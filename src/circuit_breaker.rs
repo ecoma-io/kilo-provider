@@ -311,6 +311,10 @@ impl CircuitBreaker {
         self.transport_cancel(proxy_id);
     }
 
+    /// Legacy unconditioned success: closes the circuit regardless of any
+    /// generation/lease context. Test-only callers; production paths must use
+    /// the lease-aware API (`TransportGuard::record_success`).
+    #[cfg(any(test, doc))]
     pub fn transport_record_success(&self, proxy_id: &str) {
         let mut map = self.transport.lock().unwrap();
         Self::prune_map(&mut map);
@@ -358,6 +362,10 @@ impl CircuitBreaker {
         }
     }
 
+    /// Legacy unconditioned failure: opens the circuit and invalidates every
+    /// in-flight lease. Test-only callers; production paths must use
+    /// `TransportGuard::record_failure`.
+    #[cfg(any(test, doc))]
     pub fn transport_record_failure(&self, proxy_id: &str) {
         let cfg = self.cfg();
         let cooldown = Duration::from_secs(cfg.proxy_failure_cooldown_secs);
@@ -1288,6 +1296,194 @@ mod tests {
             "cleanup must bound model map size, got {}",
             map.len()
         );
+    }
+
+    #[test]
+    fn lease_outcome_applies_once_breaker_level() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            proxy_failure_cooldown_secs: 0,
+            half_open_max_probes: 1,
+            retry_after_max_secs: 300,
+            ..cfg()
+        });
+        cb.transport_record_failure("p0");
+        std::thread::sleep(Duration::from_millis(5));
+        let lease = cb.transport_reserve_lease("p0").expect("probe");
+        assert!(cb.transport_record_failure_lease("p0", lease));
+        let (opened1, cooldown1) = {
+            let map = cb.transport.lock().unwrap();
+            let e = map.get("p0").unwrap();
+            (e.opened_at, e.cooldown)
+        };
+        // Second application of the same lease must be rejected.
+        assert!(!cb.transport_record_failure_lease("p0", lease));
+        let (opened2, cooldown2) = {
+            let map = cb.transport.lock().unwrap();
+            let e = map.get("p0").unwrap();
+            (e.opened_at, e.cooldown)
+        };
+        assert_eq!(opened1, opened2, "opened_at must not be overwritten");
+        assert_eq!(cooldown1, cooldown2);
+        assert_eq!(cb.transport_state("p0"), BreakerState::Open);
+    }
+
+    #[test]
+    fn cancel_lease_stale_generation_noop() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            proxy_failure_cooldown_secs: 0,
+            half_open_max_probes: 1,
+            retry_after_max_secs: 300,
+            ..cfg()
+        });
+        // Old-generation lease.
+        let stale = cb.transport_reserve_lease("p0").expect("lease");
+        cb.transport_record_failure("p0");
+        std::thread::sleep(Duration::from_millis(5));
+        // Current-generation probe.
+        let probe = cb.transport_reserve_lease("p0").expect("probe");
+        // Cancelling the stale lease must not touch the current probe slot.
+        cb.transport_cancel_lease("p0", stale);
+        assert_eq!(cb.half_open_inflight_transport("p0"), 1);
+        assert_eq!(cb.transport_state("p0"), BreakerState::HalfOpen);
+        // Current probe still finalizable.
+        assert!(cb.transport_record_success_lease("p0", probe));
+        assert_eq!(cb.transport_state("p0"), BreakerState::Closed);
+    }
+
+    #[test]
+    fn probe_failure_reopens_with_fresh_cooldown() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            proxy_failure_cooldown_secs: 7,
+            half_open_max_probes: 1,
+            retry_after_max_secs: 300,
+            ..cfg()
+        });
+        cb.transport_record_failure("p0");
+        // Expire the 7s cooldown by backdating opened_at.
+        {
+            let mut map = cb.transport.lock().unwrap();
+            let e = map.get_mut("p0").unwrap();
+            e.opened_at = Some(Instant::now() - Duration::from_secs(8));
+        }
+        let lease = cb.transport_reserve_lease("p0").expect("probe");
+        assert!(cb.transport_record_failure_lease("p0", lease));
+        let map = cb.transport.lock().unwrap();
+        let e = map.get("p0").unwrap();
+        assert_eq!(e.state, BreakerState::Open);
+        assert_eq!(e.cooldown, Duration::from_secs(7));
+        assert_eq!(
+            e.opened_at.map(|t| t.elapsed() < Duration::from_secs(1)),
+            Some(true),
+            "probe failure must reopen with a fresh opened_at"
+        );
+    }
+
+    #[test]
+    fn rate_limit_and_model_stale_lease_rejected() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            rate_limit_cooldown_secs: 0,
+            model_not_found_cooldown_secs: 0,
+            half_open_max_probes: 1,
+            retry_after_max_secs: 300,
+            ..cfg()
+        });
+        // Rate limit scope.
+        let stale_rl = cb.rate_limit_reserve_lease("p0", "o").expect("lease");
+        cb.rate_limit_record_failure("p0", "o", None);
+        std::thread::sleep(Duration::from_millis(5));
+        let probe_rl = cb.rate_limit_reserve_lease("p0", "o").expect("probe");
+        assert!(!cb.rate_limit_record_success_lease("p0", "o", stale_rl));
+        assert_eq!(cb.rate_limit_state("p0", "o"), BreakerState::HalfOpen);
+        assert!(cb.rate_limit_record_success_lease("p0", "o", probe_rl));
+        // Model scope.
+        let stale_m = cb.model_reserve_lease("m0").expect("lease");
+        cb.model_record_failure("m0");
+        std::thread::sleep(Duration::from_millis(5));
+        let probe_m = cb.model_reserve_lease("m0").expect("probe");
+        assert!(!cb.model_record_failure_lease("m0", stale_m));
+        assert_eq!(cb.model_state("m0"), BreakerState::HalfOpen);
+        assert!(cb.model_record_success_lease("m0", probe_m));
+        assert_eq!(cb.model_state("m0"), BreakerState::Closed);
+    }
+
+    #[test]
+    fn outcome_wrappers_zero_lease_noop() {
+        let cb = CircuitBreaker::new(cfg());
+        cb.transport_record_failure("p0");
+        assert!(!cb.transport_record_failure_outcome("p0", 0));
+        assert!(!cb.transport_record_success_outcome("p0", 0));
+        assert!(!cb.rate_limit_record_failure_outcome("p0", "o", 0, None));
+        assert!(!cb.rate_limit_record_success_outcome("p0", "o", 0));
+        assert!(!cb.model_record_failure_outcome("m0", 0));
+        assert!(!cb.model_record_success_outcome("m0", 0));
+        assert_eq!(cb.transport_state("p0"), BreakerState::Open);
+    }
+
+    #[test]
+    fn retry_after_capped_in_lease_failure() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            retry_after_max_secs: 30,
+            ..cfg()
+        });
+        let lease = cb.rate_limit_reserve_lease("p0", "o").expect("lease");
+        assert!(cb.rate_limit_record_failure_lease(
+            "p0",
+            "o",
+            lease,
+            Some(Duration::from_secs(100_000))
+        ));
+        let map = cb.rate_limit.lock().unwrap();
+        let e = map.get(&("p0".to_string(), "o".to_string())).unwrap();
+        assert_eq!(e.cooldown, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn half_open_multi_probe_concurrency() {
+        use std::sync::Arc;
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            proxy_failure_cooldown_secs: 0,
+            half_open_max_probes: 3,
+            retry_after_max_secs: 300,
+            ..cfg()
+        }));
+        cb.transport_record_failure("p0");
+        std::thread::sleep(Duration::from_millis(5));
+        let cb2 = cb.clone();
+        let h = std::thread::spawn(move || cb2.transport_reserve("p0"));
+        let r1 = cb.transport_reserve("p0");
+        let r2 = h.join().unwrap();
+        // With max 3 both main-thread and child probes must be admitted.
+        assert!(r1 && r2);
+        assert_eq!(cb.half_open_inflight_transport("p0"), 2);
+        // 3rd admitted, 4th rejected.
+        assert!(cb.transport_reserve("p0"));
+        assert!(!cb.transport_reserve("p0"));
+    }
+
+    #[test]
+    fn retain_models_keeps_open_entry_for_cataloged_model() {
+        use std::sync::Arc;
+        let cb = Arc::new(CircuitBreaker::new(cfg()));
+        cb.model_record_failure("kept-model");
+        let mut active = HashSet::new();
+        active.insert("kept-model".to_string());
+        cb.retain_models(&active);
+        assert_eq!(cb.model_state("kept-model"), BreakerState::Open);
+    }
+
+    #[test]
+    fn retain_proxies_keeps_active_lease_of_removed_proxy() {
+        use std::sync::Arc;
+        let cb = Arc::new(CircuitBreaker::new(cfg()));
+        let lease = cb.transport_reserve_lease("removed-proxy").expect("lease");
+        let rg = cb
+            .rate_limit_reserve_lease("removed-proxy", "o")
+            .expect("rl lease");
+        let active = HashSet::new();
+        cb.retain_proxies(&active);
+        // Entries with live leases survive; leases remain finalizable.
+        assert!(cb.transport_record_success_lease("removed-proxy", lease));
+        assert!(cb.rate_limit_record_success_lease("removed-proxy", "o", rg));
     }
 
     #[test]
