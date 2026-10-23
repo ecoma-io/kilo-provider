@@ -100,8 +100,21 @@ pub fn upstream_url(client_path: &str) -> Result<String, AppError> {
             "unsupported upstream client path (expected /v1/...): {client_path:?}"
         )));
     };
-    let base = UPSTREAM_BASE_URL.trim_end_matches('/');
+    let base = test_upstream_override()
+        .unwrap_or_else(|| UPSTREAM_BASE_URL.trim_end_matches('/').to_string());
     Ok(format!("{base}{upstream_path}"))
+}
+
+/// Test-only seam: when compiled for tests, allows pointing the gateway at a
+/// local fake upstream. Always `None` in release builds.
+#[cfg(test)]
+fn test_upstream_override() -> Option<String> {
+    crate::router::test_upstream_base().map(|u| u.trim_end_matches('/').to_string())
+}
+
+#[cfg(not(test))]
+fn test_upstream_override() -> Option<String> {
+    None
 }
 
 /// Whether a client path is an inference endpoint that requires a `model`.
