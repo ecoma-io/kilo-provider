@@ -242,6 +242,24 @@ impl CatalogFetchError {
     }
 }
 
+fn parse_retry_after(h: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    if let Some(v) = h.get("retry-after")
+        && let Ok(s) = v.to_str()
+    {
+        let s = s.trim();
+        if let Ok(secs) = s.parse::<u64>() {
+            return Some(std::time::Duration::from_secs(secs));
+        }
+        if let Ok(dt) = httpdate::parse_http_date(s) {
+            let now = std::time::SystemTime::now();
+            if let Ok(dur) = dt.duration_since(now) {
+                return Some(dur);
+            }
+        }
+    }
+    None
+}
+
 pub async fn fetch_catalog(
     client: &reqwest::Client,
     base_url: &reqwest::Url,
@@ -258,12 +276,7 @@ pub async fn fetch_catalog(
         .map_err(|e| CatalogFetchError::Connect(e.to_string()))?;
     let status = resp.status();
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_after = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(std::time::Duration::from_secs);
+        let retry_after = parse_retry_after(resp.headers());
         return Err(CatalogFetchError::RateLimited(retry_after));
     }
     if !status.is_success() {
@@ -272,12 +285,16 @@ pub async fn fetch_catalog(
             format!("catalog fetch failed: HTTP {status}"),
         ));
     }
-    // content-type check (optional but helpful)
-    // read bytes
+    // read bytes with a cap
     let bytes = resp
         .bytes()
         .await
         .map_err(|e| CatalogFetchError::Connect(format!("catalog body read failed: {e}")))?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(CatalogFetchError::Schema(
+            "catalog response too large".to_string(),
+        ));
+    }
     let v: Value = serde_json::from_slice(&bytes)
         .map_err(|e| CatalogFetchError::Schema(format!("catalog JSON parse failed: {e}")))?;
     let data = v.get("data").and_then(|d| d.as_array()).ok_or_else(|| {

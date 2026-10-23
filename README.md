@@ -22,20 +22,27 @@ Copy `config.example.toml` and point `CONFIG_PATH` at your copy. Full schema:
 
 ```toml
 [proxy_pool]
-reload_interval_secs = 1       # hot-reload polling interval
-connect_timeout_secs = 10      # per-proxy connect timeout
-proxies = ["http://user:pass@host:port", ...]   # at least one required
+reload_interval_secs = 1          # hot-reload polling interval
+connect_timeout_secs = 10         # per-proxy connect timeout
+max_concurrent_requests = 64      # admission control
+request_body_timeout_secs = 30    # client body read timeout
+response_header_timeout_secs = 30 # upstream headers timeout
+stream_idle_timeout_secs = 60     # idle between SSE chunks
+proxies = ["http://user:pass@host:port", ...]   # at least one, http:// only
 
 [models]
-refresh_interval_secs = 300    # periodic catalog refresh
-stale_ttl_secs = 900           # snapshot validity window
-max_entries = 2048             # cap on catalog size
+refresh_interval_secs = 300       # periodic catalog refresh
+stale_ttl_secs = 900             # snapshot validity window
+max_entries = 2048               # cap on catalog size
+recovery_initial_backoff_secs = 2 # fast recovery backoff
+recovery_max_backoff_secs = 30
 
 [circuit_breaker]
 proxy_failure_cooldown_secs = 60
 rate_limit_cooldown_secs = 120
 model_not_found_cooldown_secs = 300
 half_open_max_probes = 1
+retry_after_max_secs = 300
 ```
 
 Proxy pool must not be empty; there is no direct (non-proxy) fallback.

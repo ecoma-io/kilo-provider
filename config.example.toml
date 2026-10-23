@@ -5,6 +5,10 @@
 [proxy_pool]
 reload_interval_secs = 1
 connect_timeout_secs = 10
+max_concurrent_requests = 64
+request_body_timeout_secs = 30
+response_header_timeout_secs = 30
+stream_idle_timeout_secs = 60
 proxies = [
     "http://proxy-a.example.internal:8080",
     "http://proxy-b.example.internal:8080",
@@ -14,9 +18,12 @@ proxies = [
 refresh_interval_secs = 300
 stale_ttl_secs = 900
 max_entries = 2048
+recovery_initial_backoff_secs = 2
+recovery_max_backoff_secs = 30
 
 [circuit_breaker]
 proxy_failure_cooldown_secs = 60
 rate_limit_cooldown_secs = 120
 model_not_found_cooldown_secs = 300
 half_open_max_probes = 1
+retry_after_max_secs = 300

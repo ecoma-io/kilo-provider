@@ -19,6 +19,14 @@ pub struct Config {
 pub struct ProxyPoolConfig {
     pub reload_interval_secs: u64,
     pub connect_timeout_secs: u64,
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+    #[serde(default = "default_request_body_timeout_secs")]
+    pub request_body_timeout_secs: u64,
+    #[serde(default = "default_response_header_timeout_secs")]
+    pub response_header_timeout_secs: u64,
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
     pub proxies: Vec<String>,
 }
 
@@ -28,6 +36,10 @@ pub struct ModelsConfig {
     pub refresh_interval_secs: u64,
     pub stale_ttl_secs: u64,
     pub max_entries: usize,
+    #[serde(default = "default_recovery_initial_backoff_secs")]
+    pub recovery_initial_backoff_secs: u64,
+    #[serde(default = "default_recovery_max_backoff_secs")]
+    pub recovery_max_backoff_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +49,8 @@ pub struct CircuitBreakerConfig {
     pub rate_limit_cooldown_secs: u64,
     pub model_not_found_cooldown_secs: u64,
     pub half_open_max_probes: usize,
+    #[serde(default = "default_retry_after_max_secs")]
+    pub retry_after_max_secs: u64,
 }
 
 impl Config {
@@ -68,10 +82,36 @@ impl Config {
                 "proxy_pool.connect_timeout_secs must be >= 1".into(),
             ));
         }
+        if self.proxy_pool.max_concurrent_requests == 0 {
+            return Err(AppError::Config(
+                "proxy_pool.max_concurrent_requests must be >= 1".into(),
+            ));
+        }
+        if self.proxy_pool.request_body_timeout_secs == 0 {
+            return Err(AppError::Config(
+                "proxy_pool.request_body_timeout_secs must be >= 1".into(),
+            ));
+        }
+        if self.proxy_pool.response_header_timeout_secs == 0 {
+            return Err(AppError::Config(
+                "proxy_pool.response_header_timeout_secs must be >= 1".into(),
+            ));
+        }
+        if self.proxy_pool.stream_idle_timeout_secs == 0 {
+            return Err(AppError::Config(
+                "proxy_pool.stream_idle_timeout_secs must be >= 1".into(),
+            ));
+        }
         for p in &self.proxy_pool.proxies {
             if p.trim().is_empty() {
                 return Err(AppError::Config(
                     "proxy_pool.proxies contains an empty entry".into(),
+                ));
+            }
+            let lower = p.trim().to_lowercase();
+            if !lower.starts_with("http://") {
+                return Err(AppError::Config(
+                    "proxy_pool.proxies entries must use the http:// scheme".into(),
                 ));
             }
         }
@@ -87,6 +127,21 @@ impl Config {
         }
         if self.models.max_entries == 0 {
             return Err(AppError::Config("models.max_entries must be >= 1".into()));
+        }
+        if self.models.recovery_initial_backoff_secs == 0 {
+            return Err(AppError::Config(
+                "models.recovery_initial_backoff_secs must be >= 1".into(),
+            ));
+        }
+        if self.models.recovery_max_backoff_secs == 0 {
+            return Err(AppError::Config(
+                "models.recovery_max_backoff_secs must be >= 1".into(),
+            ));
+        }
+        if self.models.recovery_initial_backoff_secs > self.models.recovery_max_backoff_secs {
+            return Err(AppError::Config(
+                "models.recovery_initial_backoff_secs must be <= recovery_max_backoff_secs".into(),
+            ));
         }
         if self.circuit_breaker.proxy_failure_cooldown_secs == 0 {
             return Err(AppError::Config(
@@ -116,6 +171,37 @@ impl ProxyPoolConfig {
     pub fn connect_timeout(&self) -> Duration {
         Duration::from_secs(self.connect_timeout_secs)
     }
+    pub fn request_body_timeout(&self) -> Duration {
+        Duration::from_secs(self.request_body_timeout_secs)
+    }
+    pub fn response_header_timeout(&self) -> Duration {
+        Duration::from_secs(self.response_header_timeout_secs)
+    }
+    pub fn stream_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.stream_idle_timeout_secs)
+    }
+}
+
+fn default_max_concurrent_requests() -> usize {
+    64
+}
+fn default_request_body_timeout_secs() -> u64 {
+    30
+}
+fn default_response_header_timeout_secs() -> u64 {
+    30
+}
+fn default_stream_idle_timeout_secs() -> u64 {
+    60
+}
+fn default_recovery_initial_backoff_secs() -> u64 {
+    2
+}
+fn default_recovery_max_backoff_secs() -> u64 {
+    30
+}
+fn default_retry_after_max_secs() -> u64 {
+    300
 }
 
 #[cfg(test)]
