@@ -194,6 +194,11 @@ pub struct CircuitBreaker {
     rate_limit: Mutex<HashMap<(String, String), Entry>>,
     model: Mutex<HashMap<String, Entry>>,
     config: Mutex<CircuitBreakerConfig>,
+    /// Current catalog model-ID set, installed by `retain_models`. When set,
+    /// a model entry whose last lease ends and whose ID is absent from this
+    /// set is dropped immediately (deferred cleanup for entries that
+    /// `retain_models` had to keep alive because a lease was in flight).
+    catalog_models: std::sync::RwLock<Option<HashSet<String>>>,
 }
 
 impl Default for CircuitBreaker {
@@ -215,6 +220,7 @@ impl CircuitBreaker {
             rate_limit: Mutex::new(HashMap::new()),
             model: Mutex::new(HashMap::new()),
             config: Mutex::new(config),
+            catalog_models: std::sync::RwLock::new(None),
         }
     }
 
@@ -281,6 +287,10 @@ impl CircuitBreaker {
         self.transport_reserve(proxy_id)
     }
 
+    /// Legacy unconditioned cancel: clears every lease for the proxy with no
+    /// generation validation. Test-only callers; production paths must use
+    /// `transport_cancel_lease`.
+    #[cfg(any(test, doc))]
     pub fn transport_cancel(&self, proxy_id: &str) {
         let mut map = self.transport.lock().unwrap();
         if let Some(e) = map.get_mut(proxy_id) {
@@ -304,9 +314,11 @@ impl CircuitBreaker {
             e.last_touched = Instant::now();
         }
     }
+    #[cfg(any(test, doc))]
     pub fn transport_release(&self, proxy_id: &str) {
         self.transport_cancel(proxy_id);
     }
+    #[cfg(any(test, doc))]
     pub fn transport_abort(&self, proxy_id: &str) {
         self.transport_cancel(proxy_id);
     }
@@ -418,12 +430,14 @@ impl CircuitBreaker {
     }
 
     // outcome helpers (lease-aware, no unconditional overwrite)
+    #[cfg(any(test, doc))]
     pub fn transport_record_failure_outcome(&self, proxy_id: &str, lease_id: u64) -> bool {
         if lease_id != 0 {
             return self.transport_record_failure_lease(proxy_id, lease_id);
         }
         false
     }
+    #[cfg(any(test, doc))]
     pub fn transport_record_success_outcome(&self, proxy_id: &str, lease_id: u64) -> bool {
         if lease_id != 0 {
             return self.transport_record_success_lease(proxy_id, lease_id);
@@ -474,6 +488,10 @@ impl CircuitBreaker {
         self.rate_limit_reserve(proxy_id, origin)
     }
 
+    /// Legacy unconditioned cancel: clears every lease with no generation
+    /// validation. Test-only callers; production paths must use
+    /// `rate_limit_cancel_lease`.
+    #[cfg(any(test, doc))]
     pub fn rate_limit_cancel(&self, proxy_id: &str, origin: &str) {
         let mut map = self.rate_limit.lock().unwrap();
         if let Some(e) = map.get_mut(&(proxy_id.to_string(), origin.to_string())) {
@@ -496,13 +514,16 @@ impl CircuitBreaker {
             e.last_touched = Instant::now();
         }
     }
+    #[cfg(any(test, doc))]
     pub fn rate_limit_release(&self, proxy_id: &str, origin: &str) {
         self.rate_limit_cancel(proxy_id, origin);
     }
+    #[cfg(any(test, doc))]
     pub fn rate_limit_abort(&self, proxy_id: &str, origin: &str) {
         self.rate_limit_cancel(proxy_id, origin);
     }
 
+    #[cfg(any(test, doc))]
     pub fn rate_limit_record_success(&self, proxy_id: &str, origin: &str) {
         let mut map = self.rate_limit.lock().unwrap();
         Self::prune_map(&mut map);
@@ -554,6 +575,7 @@ impl CircuitBreaker {
         }
     }
 
+    #[cfg(any(test, doc))]
     pub fn rate_limit_record_failure(
         &self,
         proxy_id: &str,
@@ -627,6 +649,7 @@ impl CircuitBreaker {
         }
     }
 
+    #[cfg(any(test, doc))]
     pub fn rate_limit_record_failure_outcome(
         &self,
         proxy_id: &str,
@@ -639,6 +662,7 @@ impl CircuitBreaker {
         }
         false
     }
+    #[cfg(any(test, doc))]
     pub fn rate_limit_record_success_outcome(
         &self,
         proxy_id: &str,
@@ -690,6 +714,7 @@ impl CircuitBreaker {
         self.model_reserve(model_id)
     }
 
+    #[cfg(any(test, doc))]
     pub fn model_cancel(&self, model_id: &str) {
         let mut map = self.model.lock().unwrap();
         if let Some(e) = map.get_mut(model_id) {
@@ -700,25 +725,31 @@ impl CircuitBreaker {
         }
     }
     pub fn model_cancel_lease(&self, model_id: &str, lease_id: u64) {
-        let mut map = self.model.lock().unwrap();
-        if let Some(e) = map.get_mut(model_id) {
-            if let Some(lease_generation) = e.lease_gen.get(&lease_id).copied()
-                && lease_generation == e.generation
-            {
-                e.active.remove(&lease_id);
-                e.probes.remove(&lease_id);
-                e.lease_gen.remove(&lease_id);
+        {
+            let mut map = self.model.lock().unwrap();
+            if let Some(e) = map.get_mut(model_id) {
+                if let Some(lease_generation) = e.lease_gen.get(&lease_id).copied()
+                    && lease_generation == e.generation
+                {
+                    e.active.remove(&lease_id);
+                    e.probes.remove(&lease_id);
+                    e.lease_gen.remove(&lease_id);
+                }
+                e.last_touched = Instant::now();
             }
-            e.last_touched = Instant::now();
         }
+        self.model_maybe_cleanup(model_id);
     }
+    #[cfg(any(test, doc))]
     pub fn model_release(&self, model_id: &str) {
         self.model_cancel(model_id);
     }
+    #[cfg(any(test, doc))]
     pub fn model_abort(&self, model_id: &str) {
         self.model_cancel(model_id);
     }
 
+    #[cfg(any(test, doc))]
     pub fn model_record_success(&self, model_id: &str) {
         let mut map = self.model.lock().unwrap();
         Self::prune_map(&mut map);
@@ -734,37 +765,44 @@ impl CircuitBreaker {
         }
     }
     pub fn model_record_success_lease(&self, model_id: &str, lease_id: u64) -> bool {
-        let mut map = self.model.lock().unwrap();
-        Self::prune_map(&mut map);
-        if let Some(e) = map.get_mut(model_id) {
-            e.last_touched = Instant::now();
-            let lease_generation = match e.lease_gen.get(&lease_id).copied() {
-                Some(g) => g,
-                None => return false,
-            };
-            if lease_generation != e.generation {
-                return false;
+        let outcome = {
+            let mut map = self.model.lock().unwrap();
+            Self::prune_map(&mut map);
+            if let Some(e) = map.get_mut(model_id) {
+                e.last_touched = Instant::now();
+                let lease_generation = match e.lease_gen.get(&lease_id).copied() {
+                    Some(g) => g,
+                    None => return false,
+                };
+                if lease_generation != e.generation {
+                    return false;
+                }
+                if !e.active.remove(&lease_id) {
+                    return false;
+                }
+                let was_probe = e.probes.remove(&lease_id);
+                e.lease_gen.remove(&lease_id);
+                if e.state == BreakerState::HalfOpen && was_probe {
+                    e.state = BreakerState::Closed;
+                    e.opened_at = None;
+                    e.cooldown = Duration::ZERO;
+                    e.active.clear();
+                    e.probes.clear();
+                    e.lease_gen.clear();
+                    e.generation = e.generation.wrapping_add(1);
+                }
+                true
+            } else {
+                false
             }
-            if !e.active.remove(&lease_id) {
-                return false;
-            }
-            let was_probe = e.probes.remove(&lease_id);
-            e.lease_gen.remove(&lease_id);
-            if e.state == BreakerState::HalfOpen && was_probe {
-                e.state = BreakerState::Closed;
-                e.opened_at = None;
-                e.cooldown = Duration::ZERO;
-                e.active.clear();
-                e.probes.clear();
-                e.lease_gen.clear();
-                e.generation = e.generation.wrapping_add(1);
-            }
-            true
-        } else {
-            false
+        };
+        if outcome {
+            self.model_maybe_cleanup(model_id);
         }
+        outcome
     }
 
+    #[cfg(any(test, doc))]
     pub fn model_record_failure(&self, model_id: &str) {
         let cfg = self.cfg();
         let cooldown = Duration::from_secs(cfg.model_not_found_cooldown_secs);
@@ -783,36 +821,45 @@ impl CircuitBreaker {
     pub fn model_record_failure_lease(&self, model_id: &str, lease_id: u64) -> bool {
         let cfg = self.cfg();
         let cooldown = Duration::from_secs(cfg.model_not_found_cooldown_secs);
-        let mut map = self.model.lock().unwrap();
-        Self::prune_map(&mut map);
-        if let Some(e) = map.get_mut(model_id) {
-            e.last_touched = Instant::now();
-            let lease_generation = match e.lease_gen.get(&lease_id).copied() {
-                Some(g) => g,
-                None => return false,
-            };
-            if lease_generation != e.generation {
-                return false;
+        let outcome = {
+            let mut map = self.model.lock().unwrap();
+            Self::prune_map(&mut map);
+            if let Some(e) = map.get_mut(model_id) {
+                e.last_touched = Instant::now();
+                let lease_generation = match e.lease_gen.get(&lease_id).copied() {
+                    Some(g) => g,
+                    None => return false,
+                };
+                if lease_generation != e.generation {
+                    return false;
+                }
+                if !e.active.remove(&lease_id) {
+                    return false;
+                }
+                let was_probe = e.probes.remove(&lease_id);
+                e.lease_gen.remove(&lease_id);
+                if e.state == BreakerState::Closed
+                    || (e.state == BreakerState::HalfOpen && was_probe)
+                {
+                    e.state = BreakerState::Open;
+                    e.opened_at = Some(Instant::now());
+                    e.cooldown = cooldown;
+                    e.active.clear();
+                    e.probes.clear();
+                    e.lease_gen.clear();
+                    e.generation = e.generation.wrapping_add(1);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
             }
-            if !e.active.remove(&lease_id) {
-                return false;
-            }
-            let was_probe = e.probes.remove(&lease_id);
-            e.lease_gen.remove(&lease_id);
-            if e.state == BreakerState::Closed || (e.state == BreakerState::HalfOpen && was_probe) {
-                e.state = BreakerState::Open;
-                e.opened_at = Some(Instant::now());
-                e.cooldown = cooldown;
-                e.active.clear();
-                e.probes.clear();
-                e.lease_gen.clear();
-                e.generation = e.generation.wrapping_add(1);
-                return true;
-            }
-            false
-        } else {
-            false
+        };
+        if outcome {
+            self.model_maybe_cleanup(model_id);
         }
+        outcome
     }
     pub fn model_record_failure_outcome(&self, model_id: &str, lease_id: u64) -> bool {
         if lease_id != 0 {
@@ -922,8 +969,37 @@ impl CircuitBreaker {
         }
     }
     pub fn retain_models(&self, active: &HashSet<String>) {
+        {
+            let mut map = self.model.lock().unwrap();
+            map.retain(|k, e| active.contains(k) || !e.active.is_empty() || !e.probes.is_empty());
+        }
+        // Install the catalog set so lease-finalization paths can perform
+        // deferred cleanup of entries retained only because a lease was in
+        // flight when the catalog removed their model.
+        *self.catalog_models.write().unwrap() = Some(active.clone());
+    }
+
+    /// Called after a model lease ends (success/failure/cancel). If the entry
+    /// holds no remaining leases/probes and its model is not in the current
+    /// catalog set, the stale entry is dropped: cleanup does not depend on a
+    /// later `retain_models` call. Never touches entries with valid leases or
+    /// models still in the catalog.
+    fn model_maybe_cleanup(&self, model_id: &str) {
+        let in_catalog = match self.catalog_models.read().unwrap().as_ref() {
+            Some(set) => set.contains(model_id),
+            None => true, // no catalog installed: never auto-drop
+        };
+        if in_catalog {
+            return;
+        }
         let mut map = self.model.lock().unwrap();
-        map.retain(|k, e| active.contains(k) || !e.active.is_empty() || !e.probes.is_empty());
+        let remove = match map.get(model_id) {
+            Some(e) => e.active.is_empty() && e.probes.is_empty(),
+            None => false,
+        };
+        if remove {
+            map.remove(model_id);
+        }
     }
 
     // helpers
@@ -934,6 +1010,10 @@ impl CircuitBreaker {
             .get(proxy_id)
             .map(|e| e.state)
             .unwrap_or(BreakerState::Closed)
+    }
+    /// Test/inspection helper: whether an entry exists for this model.
+    pub fn model_contains(&self, model_id: &str) -> bool {
+        self.model.lock().unwrap().contains_key(model_id)
     }
     pub fn model_state(&self, model_id: &str) -> BreakerState {
         self.model
@@ -1259,6 +1339,285 @@ mod tests {
         assert_ne!(cb.transport_state("p0"), BreakerState::Closed);
     }
 
+    // ---- F2: ambiguous 404 outcomes must not close a HalfOpen breaker ----
+
+    fn open_model(cb: &CircuitBreaker, id: &str) {
+        cb.model_record_failure(id);
+    }
+
+    /// Backdate opened_at so the cooldown has already elapsed.
+    fn backdate_model(cb: &CircuitBreaker, id: &str) {
+        let mut map = cb.model.lock().unwrap();
+        if let Some(e) = map.get_mut(id) {
+            e.opened_at = Some(Instant::now() - Duration::from_secs(3600));
+        }
+    }
+
+    #[test]
+    fn half_open_probe_unrelated_404_does_not_close_breaker() {
+        // Breaker HalfOpen via probe; the probe receives an unrelated 404
+        // (no model-unavailable evidence). The probe lease must be cancelled
+        // and the breaker must NOT be closed.
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            proxy_failure_cooldown_secs: 0,
+            model_not_found_cooldown_secs: 300,
+            half_open_max_probes: 1,
+            retry_after_max_secs: 300,
+            ..cfg()
+        });
+        open_model(&cb, "m0");
+        backdate_model(&cb, "m0");
+        let probe = cb.model_reserve_lease("m0").expect("probe");
+        assert_eq!(cb.model_state("m0"), BreakerState::HalfOpen);
+        // Simulate the classified-stream "inconclusive" path: cancel, no
+        // success recorded (previously record_success() closed the breaker).
+        cb.model_cancel_lease("m0", probe);
+        assert_eq!(
+            cb.model_state("m0"),
+            BreakerState::HalfOpen,
+            "ambiguous 404 must not close a HalfOpen breaker"
+        );
+    }
+
+    #[test]
+    fn half_open_probe_confirmed_unavailable_opens_with_cooldown() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            model_not_found_cooldown_secs: 42,
+            half_open_max_probes: 1,
+            retry_after_max_secs: 300,
+            ..cfg()
+        });
+        cb.model_record_failure("m0");
+        backdate_model(&cb, "m0");
+        let probe = cb.model_reserve_lease("m0").expect("probe");
+        assert_eq!(cb.model_state("m0"), BreakerState::HalfOpen);
+        assert!(cb.model_record_failure_lease("m0", probe));
+        assert_eq!(cb.model_state("m0"), BreakerState::Open);
+        let map = cb.model.lock().unwrap();
+        let e = map.get("m0").unwrap();
+        assert_eq!(e.cooldown, Duration::from_secs(42));
+    }
+
+    #[test]
+    fn half_open_probe_confirmed_success_closes_breaker() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            model_not_found_cooldown_secs: 300,
+            half_open_max_probes: 1,
+            retry_after_max_secs: 300,
+            ..cfg()
+        });
+        cb.model_record_failure("m0");
+        backdate_model(&cb, "m0");
+        let probe = cb.model_reserve_lease("m0").expect("probe");
+        assert_eq!(cb.model_state("m0"), BreakerState::HalfOpen);
+        assert!(cb.model_record_success_lease("m0", probe));
+        assert_eq!(
+            cb.model_state("m0"),
+            BreakerState::Closed,
+            "confirmed success must close a HalfOpen breaker"
+        );
+    }
+
+    #[test]
+    fn half_open_probe_body_error_leaves_breaker_half_open() {
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            model_not_found_cooldown_secs: 300,
+            half_open_max_probes: 1,
+            retry_after_max_secs: 300,
+            ..cfg()
+        }));
+        cb.model_record_failure("m0");
+        backdate_model(&cb, "m0");
+        // Body error / classification timeout path: the guard is dropped
+        // while still armed (never finalized) -> Drop cancels the lease;
+        // breaker neither opens nor closes.
+        {
+            let _guard = cb.model_reserve_guard("m0").expect("guard");
+            assert_eq!(cb.model_state("m0"), BreakerState::HalfOpen);
+            // drop guard -> cancels the probe lease
+        }
+        assert_eq!(
+            cb.model_state("m0"),
+            BreakerState::HalfOpen,
+            "dropped (cancelled) probe must not change breaker state"
+        );
+    }
+
+    // ---- F3: deferred cleanup of de-cataloged models at lease end ----
+
+    #[test]
+    fn f3_leased_entry_survives_removal_then_cleanup_at_lease_end() {
+        let cb = Arc::new(CircuitBreaker::new(cfg()));
+        cb.model_record_failure("gone");
+        backdate_model(&cb, "gone");
+        let lease = cb.model_reserve_lease("gone").expect("lease");
+        // Catalog drops "gone" while a lease is active: retain keeps it.
+        let mut active = HashSet::new();
+        active.insert("kept".to_string());
+        cb.retain_models(&active);
+        assert!(cb.model_contains("gone"), "entry must survive while leased");
+        // Lease ends; NO further retain_models call. Entry must self-clean.
+        cb.model_cancel_lease("gone", lease);
+        assert!(
+            !cb.model_contains("gone"),
+            "stale entry must be dropped at lease end without another retain_models"
+        );
+    }
+
+    #[test]
+    fn f3_cleanup_works_when_open_and_half_open() {
+        // Open entry.
+        let cb = Arc::new(CircuitBreaker::new(cfg()));
+        cb.model_record_failure("gone");
+        let active = HashSet::new();
+        cb.retain_models(&active); // "gone" not in catalog, no leases -> dropped now
+        assert!(!cb.model_contains("gone"));
+        // Open entry WITH a lease -> retained, then dropped at lease end.
+        cb.model_record_failure("gone2");
+        backdate_model(&cb, "gone2");
+        let lease = cb.model_reserve_lease("gone2").expect("lease");
+        cb.retain_models(&active);
+        assert!(cb.model_contains("gone2"), "Open leased entry survives");
+        cb.model_cancel_lease("gone2", lease);
+        assert!(
+            !cb.model_contains("gone2"),
+            "Open entry dropped at lease end"
+        );
+        // HalfOpen entry with a probe lease.
+        cb.model_record_failure("gone3");
+        backdate_model(&cb, "gone3");
+        let probe = cb.model_reserve_lease("gone3").expect("probe");
+        assert_eq!(cb.model_state("gone3"), BreakerState::HalfOpen);
+        cb.retain_models(&active);
+        assert!(cb.model_contains("gone3"), "HalfOpen leased entry survives");
+        cb.model_cancel_lease("gone3", probe);
+        assert!(
+            !cb.model_contains("gone3"),
+            "HalfOpen entry dropped at lease end"
+        );
+    }
+
+    #[test]
+    fn f3_stale_lease_end_cannot_touch_newer_generation_or_new_state() {
+        let cb = Arc::new(CircuitBreaker::new(cfg()));
+        let mut active = HashSet::new();
+        active.insert("kept".to_string());
+        // Old-generation lease for a now-de-cataloged model.
+        let stale = cb.model_reserve_lease("gone").expect("lease");
+        // New generation for the same (re-cataloged) model id.
+        let mut new_active = HashSet::new();
+        new_active.insert("gone".to_string());
+        cb.retain_models(&new_active);
+        cb.model_record_failure("gone"); // opens, bumps generation
+        cb.model_cancel_lease("gone", stale); // stale lease: must be a no-op
+        assert_eq!(cb.model_state("gone"), BreakerState::Open);
+        assert!(
+            cb.model_contains("gone"),
+            "new-generation state must be untouched and model is in catalog"
+        );
+        // Same for a stale outcome application: a lease taken before the
+        // generation bump must not be finalizable against the new state.
+        backdate_model(&cb, "gone");
+        let stale2 = cb.model_reserve_lease("gone").expect("lease2");
+        cb.model_record_failure("gone"); // bumps generation again
+        assert!(
+            !cb.model_record_success_lease("gone", stale2),
+            "stale lease outcome must be rejected after generation bump"
+        );
+        let _ = active;
+    }
+
+    #[test]
+    fn f3_in_catalog_entries_never_dropped_at_lease_end() {
+        let cb = Arc::new(CircuitBreaker::new(cfg()));
+        cb.model_record_failure("kept");
+        let mut active = HashSet::new();
+        active.insert("kept".to_string());
+        cb.retain_models(&active);
+        backdate_model(&cb, "kept");
+        let lease = cb.model_reserve_lease("kept").expect("probe");
+        assert_eq!(cb.model_state("kept"), BreakerState::HalfOpen);
+        cb.model_cancel_lease("kept", lease);
+        assert!(
+            cb.model_contains("kept"),
+            "cataloged model breaker state must never be dropped"
+        );
+        assert_eq!(cb.model_state("kept"), BreakerState::HalfOpen);
+    }
+
+    #[test]
+    fn f3_historical_models_do_not_grow_map_unbounded() {
+        let cb = Arc::new(CircuitBreaker::new(cfg()));
+        let active = HashSet::new(); // empty catalog
+        for i in 0..200 {
+            let id = format!("hist-{i}");
+            cb.model_record_failure(&id);
+            backdate_model(&cb, &id);
+            let lease = cb.model_reserve_lease(&id).expect("lease");
+            cb.retain_models(&active);
+            cb.model_cancel_lease(&id, lease);
+        }
+        let map = cb.model.lock().unwrap();
+        assert!(
+            map.len() <= 2,
+            "map must not accumulate de-cataloged historical entries, got {}",
+            map.len()
+        );
+    }
+
+    /// F3 deferred cleanup via the failure path: a de-cataloged model whose
+    /// probe is finalized with `model_record_failure_lease` (breaker opens)
+    /// must be dropped at that finalization — no later `retain_models` call.
+    #[test]
+    fn f3_failure_lease_end_cleans_decataloged_entry() {
+        let cb = Arc::new(CircuitBreaker::new(cfg()));
+        cb.model_record_failure("gone");
+        backdate_model(&cb, "gone");
+        let probe = cb.model_reserve_lease("gone").expect("probe");
+        // Catalog drops "gone" while the probe is in flight.
+        let active: HashSet<String> = HashSet::new();
+        cb.retain_models(&active);
+        assert!(cb.model_contains("gone"), "leased entry survives retain");
+        // Probe confirms model-unavailable: the failure is finalized (lease
+        // consumed, breaker transition applied) AND the now lease-free
+        // de-cataloged entry is cleaned in the same call — state reads as
+        // Closed afterwards only because the stale entry is already gone.
+        assert!(
+            cb.model_record_failure_lease("gone", probe),
+            "failure finalization must succeed"
+        );
+        assert!(
+            !cb.model_contains("gone"),
+            "failure-finalized entry must self-clean without another retain_models"
+        );
+        assert_eq!(
+            cb.model_state("gone"),
+            BreakerState::Closed,
+            "no stale Open entry may linger after cleanup"
+        );
+    }
+
+    /// F3 multi-lease last-one-out: with two leases on a de-cataloged entry,
+    /// the first finalization must keep the entry and only the second drops.
+    #[test]
+    fn f3_multi_lease_cleanup_on_last_lease_out() {
+        let cb = Arc::new(CircuitBreaker::new(cfg()));
+        let l1 = cb.model_reserve_lease("gone").expect("lease1");
+        let l2 = cb.model_reserve_lease("gone").expect("lease2");
+        let active: HashSet<String> = HashSet::new();
+        cb.retain_models(&active);
+        assert!(cb.model_contains("gone"));
+        // First lease ends: another is still active -> kept.
+        cb.model_cancel_lease("gone", l1);
+        assert!(
+            cb.model_contains("gone"),
+            "entry must be kept while a lease remains"
+        );
+        // Last lease ends: dropped.
+        cb.model_cancel_lease("gone", l2);
+        assert!(!cb.model_contains("gone"));
+    }
+
     #[test]
     fn retain_models_keeps_leased_entry_and_drops_when_lease_ends() {
         use std::sync::Arc;
@@ -1270,11 +1629,14 @@ mod tests {
         // Entry must survive cleanup while the lease is active.
         cb.retain_models(&active);
         assert_eq!(cb.model_state("removed-model"), BreakerState::Closed);
-        // End the lease; next cleanup drops the entry.
+        // End the lease: the entry must be dropped by deferred cleanup at
+        // lease end itself, with NO further retain_models call.
         cb.model_cancel_lease("removed-model", lease);
-        cb.retain_models(&active);
-        // state helper reports Closed for missing entries; verify map dropped
-        // by checking a fresh reserve starts generation at 0 (no stale entry).
+        assert!(
+            !cb.model_contains("removed-model"),
+            "de-cataloged entry must self-clean when its last lease ends"
+        );
+        // A fresh reserve starts generation at 0 (no stale entry survived).
         let lease2 = cb.model_reserve_lease("removed-model").expect("fresh");
         assert_eq!(cb.generation_model("removed-model"), 0);
         cb.model_cancel_lease("removed-model", lease2);

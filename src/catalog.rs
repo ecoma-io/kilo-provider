@@ -62,7 +62,12 @@ impl ModelCatalog {
         *self.max_entries.read().unwrap()
     }
 
-    pub fn replace(&self, models: Vec<Value>) {
+    /// Install a new snapshot from the fetched model list. Returns `true`
+    /// when the snapshot was replaced, `false` when the fetch yielded no
+    /// usable free models — the last-good snapshot is kept and the caller
+    /// must treat the refresh as failed (no success signals, no backoff
+    /// reset).
+    pub fn replace(&self, models: Vec<Value>) -> bool {
         let filtered = filter_free_models(&models);
         // dedupe by id
         let mut seen = HashSet::new();
@@ -84,7 +89,7 @@ impl ModelCatalog {
         if deduped.is_empty() {
             let mut st = self.state.write().unwrap();
             st.last_error = Some("catalog contained no usable free models".to_string());
-            return;
+            return false;
         }
         let snap = Arc::new(CatalogSnapshot {
             models: deduped,
@@ -93,6 +98,7 @@ impl ModelCatalog {
         let mut st = self.state.write().unwrap();
         st.snapshot = Some(snap);
         st.last_error = None;
+        true
     }
 
     pub fn mark_error(&self, msg: String) {
@@ -272,6 +278,33 @@ pub async fn fetch_catalog(
     header_timeout: std::time::Duration,
     max_body_bytes: usize,
 ) -> Result<Vec<Value>, CatalogFetchError> {
+    fetch_catalog_with_body_idle(
+        client,
+        base_url,
+        header_timeout,
+        header_timeout,
+        max_body_bytes,
+    )
+    .await
+}
+
+/// Like [`fetch_catalog`] but with an explicit per-chunk body idle timeout:
+/// a body that stops producing bytes for longer than `body_idle_timeout`
+/// fails as [`CatalogFetchError::BodyRead`] instead of hanging until the
+/// caller's attempt wrapper fires.
+///
+/// Note that the connect+headers phase is bounded by `header_timeout` as one
+/// unit (reqwest's `send()` covers both); a connect stall against a
+/// blackholed proxy therefore surfaces as an ambiguous [`HeaderTimeout`] —
+/// by design, since the refresh loop must not quarantine a proxy without
+/// evidence.
+pub async fn fetch_catalog_with_body_idle(
+    client: &reqwest::Client,
+    base_url: &reqwest::Url,
+    header_timeout: std::time::Duration,
+    body_idle_timeout: std::time::Duration,
+    max_body_bytes: usize,
+) -> Result<Vec<Value>, CatalogFetchError> {
     let mut url = base_url.clone();
     let base_path = url.path().trim_end_matches('/');
     url.set_path(&format!("{}/models", base_path));
@@ -291,11 +324,21 @@ pub async fn fetch_catalog(
             format!("catalog fetch failed: HTTP {status}"),
         ));
     }
-    // bounded streaming read
+    // bounded streaming read; each chunk must arrive within the idle budget
     use futures_util::StreamExt;
     let mut stream = resp.bytes_stream();
     let mut buf = Vec::new();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = tokio::time::timeout(body_idle_timeout, stream.next()).await;
+        let chunk = match next {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(CatalogFetchError::BodyRead(
+                    "catalog body read stalled (idle timeout)".to_string(),
+                ));
+            }
+        };
         let chunk = chunk.map_err(|e| CatalogFetchError::BodyRead(e.to_string()))?;
         if buf.len() + chunk.len() > max_body_bytes {
             return Err(CatalogFetchError::Schema(
@@ -429,6 +472,210 @@ mod tests {
             json!({"id":"c:free","pricing":{"prompt":"0","completion":"0"}}),
         ]);
         assert_eq!(c.len(), 3);
+    }
+
+    // ---- F5: fetch_catalog hardening tests (local fake upstream only) ----
+
+    /// Spawns a local axum server answering GET /models with `status` and
+    /// `body`. Returns its address.
+    async fn spawn_catalog_upstream(
+        status: axum::http::StatusCode,
+        body: &'static [u8],
+    ) -> std::net::SocketAddr {
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move || async move { (status, body) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        addr
+    }
+
+    fn client_for(addr: std::net::SocketAddr) -> reqwest::Client {
+        reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{addr}")).expect("proxy"))
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client")
+    }
+
+    fn catalog_url(addr: std::net::SocketAddr) -> reqwest::Url {
+        reqwest::Url::parse(&format!("http://{addr}")).expect("url")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f5_oversized_body_rejected_as_schema_not_accumulated() {
+        // 4 MiB body against a 1 MiB cap must be rejected; the read loop
+        // aborts on the first chunk crossing the cap.
+        let big = vec![b'a'; 4 * 1024 * 1024];
+        let leaked: &'static [u8] = Box::leak(big.into_boxed_slice());
+        let addr = spawn_catalog_upstream(axum::http::StatusCode::OK, leaked).await;
+        let err = fetch_catalog(
+            &client_for(addr),
+            &catalog_url(addr),
+            std::time::Duration::from_secs(5),
+            1024 * 1024,
+        )
+        .await
+        .expect_err("must reject oversized body");
+        assert!(
+            matches!(err, CatalogFetchError::Schema(ref m) if m.contains("too large")),
+            "oversized body must classify as Schema(too large), got {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f5_header_timeout_classified_distinctly() {
+        // Upstream that never responds: must yield HeaderTimeout quickly.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                // read request, never answer
+                let mut buf = [0u8; 4096];
+                use tokio::io::AsyncReadExt;
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), sock.read(&mut buf))
+                        .await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+        let started = std::time::Instant::now();
+        let err = fetch_catalog(
+            &client_for(addr),
+            &catalog_url(addr),
+            std::time::Duration::from_millis(500),
+            1024 * 1024,
+        )
+        .await
+        .expect_err("must time out");
+        assert!(
+            matches!(err, CatalogFetchError::HeaderTimeout),
+            "stalled headers must classify as HeaderTimeout, got {err}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f5_slow_drip_body_classifies_as_body_read() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    {
+                        use tokio::io::AsyncReadExt;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            sock.read(&mut buf),
+                        )
+                        .await;
+                    }
+                    // Declare a large content-length, send a few bytes,
+                    // then keep the connection open: the body can never
+                    // complete, so the only exit is the idle timeout.
+                    let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000000\r\n\r\n";
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(b"{\"data\": [").await;
+                    let _ = sock.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                });
+            }
+        });
+        let started = std::time::Instant::now();
+        let err = fetch_catalog_with_body_idle(
+            &client_for(addr),
+            &catalog_url(addr),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(500),
+            1024 * 1024,
+        )
+        .await
+        .expect_err("drip must fail via idle timeout");
+        assert!(
+            matches!(err, CatalogFetchError::BodyRead(ref m) if m.contains("stalled")),
+            "stalled body must classify as BodyRead(idle), got {err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "body idle timeout must cut the drip promptly"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f5_rate_limited_carries_retry_after() {
+        let addr = spawn_catalog_upstream(axum::http::StatusCode::TOO_MANY_REQUESTS, b"{}").await;
+        let err = fetch_catalog(
+            &client_for(addr),
+            &catalog_url(addr),
+            std::time::Duration::from_secs(5),
+            1024 * 1024,
+        )
+        .await
+        .expect_err("429 must error");
+        assert!(matches!(err, CatalogFetchError::RateLimited(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f5_http_error_and_schema_error_distinct() {
+        let addr500 =
+            spawn_catalog_upstream(axum::http::StatusCode::INTERNAL_SERVER_ERROR, b"boom").await;
+        let err = fetch_catalog(
+            &client_for(addr500),
+            &catalog_url(addr500),
+            std::time::Duration::from_secs(5),
+            1024 * 1024,
+        )
+        .await
+        .expect_err("500 must error");
+        assert!(matches!(err, CatalogFetchError::Http(500, _)), "got {err}");
+        // Schema: 200 with a non-catalog JSON body.
+        let addr_bad =
+            spawn_catalog_upstream(axum::http::StatusCode::OK, br#"{"data": [{"no_id": 1}]}"#)
+                .await;
+        let err = fetch_catalog(
+            &client_for(addr_bad),
+            &catalog_url(addr_bad),
+            std::time::Duration::from_secs(5),
+            1024 * 1024,
+        )
+        .await
+        .expect_err("schema violation must error");
+        assert!(matches!(err, CatalogFetchError::Schema(_)), "got {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f5_success_parses_models() {
+        let body = br#"{"data": [{"id":"a:free","pricing":{"prompt":"0","completion":"0"}}]}"#;
+        let addr = spawn_catalog_upstream(axum::http::StatusCode::OK, body).await;
+        let models = fetch_catalog(
+            &client_for(addr),
+            &catalog_url(addr),
+            std::time::Duration::from_secs(5),
+            1024 * 1024,
+        )
+        .await
+        .expect("must parse");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["id"], "a:free");
     }
 
     #[test]

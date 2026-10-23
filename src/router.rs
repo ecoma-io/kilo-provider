@@ -615,10 +615,21 @@ fn classified_stream_response(
             }
             // Classification phase.
             if kept < probe_len {
-                let remaining = deadline_at
+                // Each read waits at most the smaller of the time left on the
+                // classification deadline and the configured stream idle
+                // timeout: a stalled upstream must surface as an idle-timeout
+                // stream error promptly instead of hanging until the full
+                // classification deadline, while the total deadline still
+                // bounds slow-drip bodies that keep sending small chunks.
+                let to_deadline = deadline_at
                     .saturating_duration_since(tokio::time::Instant::now())
                     .max(std::time::Duration::from_millis(1));
-                match tokio::time::timeout(remaining, s.next()).await {
+                // A deadline hit while still inside the probe window is the
+                // total-deadline bound (slow drip or deadline shorter than a
+                // single read); an idle-only stall is reported as such.
+                let wait = to_deadline.min(idle);
+                let deadline_fired = to_deadline <= idle;
+                match tokio::time::timeout(wait, s.next()).await {
                     Ok(Some(Ok(bytes))) => {
                         let take = bytes.len().min(probe_len - kept);
                         probe.extend_from_slice(&bytes[..take]);
@@ -629,16 +640,42 @@ fn classified_stream_response(
                         }
                         let mut hmg = hmg;
                         if next_kept >= probe_len {
-                            // classification decided; record outcome and free buffer
+                            // classification decided on a full probe window:
+                            // confirmed model-unavailable opens the breaker;
+                            // a full window without evidence is NOT a success
+                            // signal (the response is still a 404/410), so
+                            // the probe lease is cancelled instead — the
+                            // breaker keeps its current state.
                             let unavailable = is_model_unavailable_body(&probe);
                             drop(std::mem::take(&mut probe));
-                            if let Some(g) = hmg.as_mut() {
-                                if unavailable {
+                            if unavailable {
+                                if let Some(g) = hmg.as_mut() {
                                     g.record_failure();
-                                } else {
-                                    g.record_success();
                                 }
+                            } else {
+                                drop(hmg);
+                                hmg = None;
                             }
+                        } else if bytes.is_empty() {
+                            // Zero-length chunk: no progress. Unbounded empty
+                            // chunks would spin without ever tripping either
+                            // timeout, so treat them as a protocol anomaly
+                            // and surface a stream error.
+                            return Some((
+                                Err(std::io::Error::other("upstream sent an empty body chunk")),
+                                (
+                                    s,
+                                    hg,
+                                    hmg,
+                                    hp,
+                                    idle,
+                                    kept,
+                                    probe,
+                                    pending,
+                                    deadline_at,
+                                    true,
+                                ),
+                            ));
                         }
                         return Some((
                             Ok(bytes.slice(..take)),
@@ -676,27 +713,32 @@ fn classified_stream_response(
                         ));
                     }
                     Ok(None) => {
-                        // stream ended inside the probe window: classify on what we got
+                        // stream ended inside the probe window: classify on
+                        // what we got. Confirmed model-unavailable evidence
+                        // opens the breaker; anything else (unrelated 404,
+                        // empty body) is inconclusive — cancel the probe
+                        // lease without recording success or failure so the
+                        // breaker state is untouched by ambiguous outcomes.
                         let unavailable = is_model_unavailable_body(&probe);
                         drop(std::mem::take(&mut probe));
                         let mut hmg = hmg;
-                        if let Some(g) = hmg.as_mut() {
-                            if unavailable {
-                                g.record_failure();
-                            } else {
-                                g.record_success();
-                            }
+                        if unavailable && let Some(g) = hmg.as_mut() {
+                            g.record_failure();
                         }
+                        drop(hmg);
                         return None;
                     }
                     Err(_) => {
-                        // classification deadline hit: ambiguous, do not open breaker
+                        // ambiguous: do not open the breaker; message says
+                        // which bound fired (total deadline vs idle stall)
+                        let msg = if deadline_fired {
+                            "upstream error body classification deadline exceeded"
+                        } else {
+                            "upstream error body read stalled (idle timeout)"
+                        };
                         drop(hmg);
                         return Some((
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "upstream error body read timed out",
-                            )),
+                            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, msg)),
                             (
                                 s,
                                 hg,
@@ -713,8 +755,37 @@ fn classified_stream_response(
                     }
                 }
             }
-            // Plain forwarding phase with idle timeout.
-            match tokio::time::timeout(idle, s.next()).await {
+            // Plain forwarding phase. Each read keeps the per-read idle
+            // timeout, and the classification deadline also bounds the whole
+            // remainder: a slow-drip error body can no longer hold the
+            // admission permit and leases open indefinitely.
+            let now = tokio::time::Instant::now();
+            if now >= deadline_at {
+                return Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "classified error body forwarding deadline exceeded",
+                    )),
+                    (
+                        s,
+                        hg,
+                        hmg,
+                        hp,
+                        idle,
+                        kept,
+                        probe,
+                        pending,
+                        deadline_at,
+                        true,
+                    ),
+                ));
+            }
+            match tokio::time::timeout(
+                idle.min(deadline_at.saturating_duration_since(now)),
+                s.next(),
+            )
+            .await
+            {
                 Ok(Some(Ok(bytes))) => Some((
                     Ok(bytes),
                     (
@@ -1376,18 +1447,18 @@ half_open_max_probes = 1
         .expect("no hang")
         .expect("req");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        // Reading the body must fail (aborted mid-stream), never yield a complete 100k body.
+        // Reading the body must fail (aborted mid-stream): the client must
+        // observe a real stream error. A short body delivered as a complete
+        // response (bytes() returning Ok with fewer bytes than the declared
+        // Content-Length) is a correctness bug and must fail this test.
         let body = tokio::time::timeout(std::time::Duration::from_secs(5), resp.bytes()).await;
         match body {
             Err(_) => panic!("body read hung"),
             Ok(Err(_)) => { /* stream error surfaced: correct */ }
-            Ok(Ok(b)) => {
-                assert_ne!(
-                    b.len(),
-                    100000,
-                    "partial body must not be presented as complete"
-                );
-            }
+            Ok(Ok(b)) => panic!(
+                "truncated body presented as complete: got {} bytes, expected a stream error",
+                b.len()
+            ),
         }
     }
 
@@ -1815,6 +1886,407 @@ retry_after_max_secs = 30
             state.circuit_breaker.model_state("m:free"),
             crate::circuit_breaker::BreakerState::Closed,
             "unclassifiable stalled body must not open the breaker"
+        );
+    }
+
+    /// F2 router-level: a HalfOpen model breaker probed with an unrelated
+    /// 404 must NOT be closed by the classified stream. The probe lease is
+    /// cancelled and the breaker remains HalfOpen (not Closed).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn half_open_probe_unrelated_404_keeps_breaker_half_open() {
+        let _serial = crate::router::TEST_UPSTREAM_SERIALIZE.lock().await;
+        let upstream = spawn_raw_upstream(
+            move |_req| {
+                // 404 WITHOUT model-unavailable evidence.
+                let body = b"{\"error\":{\"message\":\"resource missing\"}}";
+                let mut resp = format!(
+                    "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                resp.extend_from_slice(body);
+                resp
+            },
+            2_000,
+        )
+        .await;
+        let state = state_with_upstream(upstream); // model cooldown = 1s
+        // Install the config's breaker (cooldown 1s) — the default helper
+        // uses CircuitBreaker::default() with a 300s cooldown.
+        let cfg_cb = crate::circuit_breaker::CircuitBreaker::new(
+            state.config.read().unwrap().circuit_breaker.clone(),
+        );
+        let state = {
+            let mut s2 = state.clone();
+            s2.circuit_breaker = Arc::new(cfg_cb);
+            s2
+        };
+        // Open the model breaker, then let the cooldown elapse so the next
+        // request becomes a HalfOpen probe.
+        state.circuit_breaker.model_record_failure("m:free");
+        assert_eq!(
+            state.circuit_breaker.model_state("m:free"),
+            crate::circuit_breaker::BreakerState::Open
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let app = build_router(state.clone());
+        let gw = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = gw.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(gw, app).await.expect("serve");
+        });
+        let resp = post_inference(addr).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let _ = resp.bytes().await;
+        // The probe saw an unrelated 404: breaker must stay HalfOpen —
+        // NOT closed by record_success (old behavior), NOT reopened.
+        assert_eq!(
+            state.circuit_breaker.model_state("m:free"),
+            crate::circuit_breaker::BreakerState::HalfOpen,
+            "unrelated 404 probe must not close or reopen the breaker"
+        );
+    }
+
+    /// F1 drip-feed: an upstream sending 1 byte every ~150ms (each arrival
+    /// inside the idle window) with a SHORT classification deadline must be
+    /// cut by the total deadline, not trickle forever. This distinguishes
+    /// "deadline exists" from "idle exists".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn classification_drip_feed_bounded_by_total_deadline() {
+        let _serial = crate::router::TEST_UPSTREAM_SERIALIZE.lock().await;
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let upstream = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    {
+                        use tokio::io::AsyncReadExt;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            sock.read(&mut buf),
+                        )
+                        .await;
+                    }
+                    let head = "HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\ncontent-length: 1000000\r\n\r\n";
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.flush().await;
+                    // Drip one byte every 150ms forever: each read inside the
+                    // 2s idle window, but the 1s total deadline must cut it.
+                    for _ in 0..600 {
+                        if sock.write_all(b"x").await.is_err() {
+                            break;
+                        }
+                        let _ = sock.flush().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    }
+                });
+            }
+        });
+        let state = state_with_upstream(upstream);
+        {
+            let mut cfg = state.config.write().expect("cfg lock");
+            cfg.proxy_pool.stream_idle_timeout_secs = 2;
+        }
+        *CLASSIFY_DEADLINE_OVERRIDE.lock().expect("lock") = Some(1_000);
+        let app = build_router(state.clone());
+        let gw = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = gw.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(gw, app).await.expect("serve");
+        });
+        let started = std::time::Instant::now();
+        let resp = post_inference(addr).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = tokio::time::timeout(std::time::Duration::from_secs(10), resp.bytes()).await;
+        *CLASSIFY_DEADLINE_OVERRIDE.lock().expect("lock") = None;
+        assert!(body.is_ok(), "stream must terminate");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "deadline must actually bound the drip (ended too early: {elapsed:?})"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(9),
+            "drip must be cut by the total deadline, not trickle forever: {elapsed:?}"
+        );
+        assert_eq!(
+            state.circuit_breaker.model_state("m:free"),
+            crate::circuit_breaker::BreakerState::Closed,
+            "deadline-bound ambiguous drip must not open the breaker"
+        );
+        for _ in 0..100 {
+            if state.admission.active() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.admission.active(), 0, "permit must be released");
+    }
+
+    /// F1xF2: a HalfOpen breaker probed by a 404 whose body stalls past the
+    /// idle timeout must keep the breaker HalfOpen with the probe slot freed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn half_open_probe_classification_stall_keeps_half_open() {
+        let _serial = crate::router::TEST_UPSTREAM_SERIALIZE.lock().await;
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let upstream = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    {
+                        use tokio::io::AsyncReadExt;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            sock.read(&mut buf),
+                        )
+                        .await;
+                    }
+                    let head = "HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\ncontent-length: 1000000\r\n\r\n";
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(b"partial").await;
+                    let _ = sock.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                });
+            }
+        });
+        let state = state_with_upstream(upstream);
+        // Install the config breaker (1s cooldown) and drive Open.
+        let cfg_cb = crate::circuit_breaker::CircuitBreaker::new(
+            state.config.read().unwrap().circuit_breaker.clone(),
+        );
+        let state = {
+            let mut s2 = state.clone();
+            s2.circuit_breaker = Arc::new(cfg_cb);
+            s2
+        };
+        let lease = state
+            .circuit_breaker
+            .model_reserve_lease("m:free")
+            .expect("lease");
+        assert!(
+            state
+                .circuit_breaker
+                .model_record_failure_lease("m:free", lease)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        {
+            let mut cfg = state.config.write().expect("cfg lock");
+            cfg.proxy_pool.stream_idle_timeout_secs = 1;
+        }
+        let app = build_router(state.clone());
+        let gw = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = gw.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(gw, app).await.expect("serve");
+        });
+        let resp = post_inference(addr).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), resp.bytes()).await;
+        assert_eq!(
+            state.circuit_breaker.model_state("m:free"),
+            crate::circuit_breaker::BreakerState::HalfOpen,
+            "stalled probe must keep the breaker HalfOpen"
+        );
+        assert_eq!(
+            state.circuit_breaker.half_open_inflight_model("m:free"),
+            0,
+            "probe slot must be freed by the cancelled lease"
+        );
+    }
+
+    /// F1 forwarding phase: after classification, a slow-drip remainder must
+    /// still be bounded by the overall deadline — the stream terminates and
+    /// the permit is released instead of being held indefinitely.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwarding_phase_drip_bounded_by_deadline() {
+        let _serial = crate::router::TEST_UPSTREAM_SERIALIZE.lock().await;
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let upstream = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    {
+                        use tokio::io::AsyncReadExt;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            sock.read(&mut buf),
+                        )
+                        .await;
+                    }
+                    // Keep the body open (declared 10MiB) so the forwarding
+                    // phase is exercised: send a full 64KiB+1 probe window of
+                    // model-unavailable JSON (classification decides on the
+                    // full window, before any drip), then drip the remainder.
+                    let marker = b"{\"error\":{\"code\":\"model_not_found\",\"message\":\"no\"}}";
+                    let mut first = marker.to_vec();
+                    // pad with spaces (valid JSON whitespace tail) to 64KiB+1
+                    first.resize(64 * 1024 + 1, b' ');
+                    let head = format!(
+                        "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        10 * 1024 * 1024
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&first).await;
+                    let _ = sock.flush().await;
+                    for _ in 0..600 {
+                        if sock.write_all(b"y").await.is_err() {
+                            break;
+                        }
+                        let _ = sock.flush().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                });
+            }
+        });
+        let state = state_with_upstream(upstream);
+        {
+            let mut cfg = state.config.write().expect("cfg lock");
+            cfg.proxy_pool.stream_idle_timeout_secs = 3;
+        }
+        // Short overall deadline so the forwarding bound is observable.
+        *CLASSIFY_DEADLINE_OVERRIDE.lock().expect("lock") = Some(2_000);
+        let app = build_router(state.clone());
+        let gw = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = gw.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(gw, app).await.expect("serve");
+        });
+        let started = std::time::Instant::now();
+        let resp = post_inference(addr).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = tokio::time::timeout(std::time::Duration::from_secs(10), resp.bytes()).await;
+        *CLASSIFY_DEADLINE_OVERRIDE.lock().expect("lock") = None;
+        assert!(body.is_ok(), "forwarding drip must terminate");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(9),
+            "forwarding phase must be deadline-bounded, took {elapsed:?}"
+        );
+        // Classification saw model-unavailable evidence: breaker opens.
+        assert_eq!(
+            state.circuit_breaker.model_state("m:free"),
+            crate::circuit_breaker::BreakerState::Open,
+            "evidence-bearing 404 must open the breaker even when forwarding is cut"
+        );
+        for _ in 0..100 {
+            if state.admission.active() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.admission.active(), 0, "permit must be released");
+    }
+
+    /// F1: with a long classification deadline and a short configured stream
+    /// idle timeout, a stalled 404 body must surface via the idle timeout
+    /// (fast) instead of waiting out the classification deadline, and the
+    /// ambiguous outcome must not open the model breaker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn classification_stall_hits_idle_timeout_not_deadline() {
+        let _serial = crate::router::TEST_UPSTREAM_SERIALIZE.lock().await;
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let upstream = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    {
+                        use tokio::io::AsyncReadExt;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            sock.read(&mut buf),
+                        )
+                        .await;
+                    }
+                    // partial 404 body, then hold the connection forever
+                    let head = "HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\ncontent-length: 1000000\r\n\r\n";
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(b"plain 404, nothing model-ish").await;
+                    let _ = sock.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                });
+            }
+        });
+        let state = state_with_upstream(upstream);
+        {
+            let mut cfg = state.config.write().expect("cfg lock");
+            cfg.proxy_pool.stream_idle_timeout_secs = 2;
+        }
+        // LONG classification deadline (60s): the test must finish via the
+        // idle timeout, not this deadline.
+        *CLASSIFY_DEADLINE_OVERRIDE.lock().expect("lock") = Some(60_000);
+        let app = build_router(state.clone());
+        let gw = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = gw.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(gw, app).await.expect("serve");
+        });
+        let started = std::time::Instant::now();
+        let resp = post_inference(addr).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = tokio::time::timeout(std::time::Duration::from_secs(10), resp.bytes()).await;
+        *CLASSIFY_DEADLINE_OVERRIDE.lock().expect("lock") = None;
+        assert!(body.is_ok(), "stream must terminate, not hang");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(9),
+            "idle timeout (2s) must cut the stall well before the 60s \
+             classification deadline, took {elapsed:?}"
+        );
+        assert_eq!(
+            state.circuit_breaker.model_state("m:free"),
+            crate::circuit_breaker::BreakerState::Closed,
+            "ambiguous stall must not open the model breaker"
+        );
+        // permit must be released after the errored stream is dropped
+        drop(body);
+        for _ in 0..100 {
+            if state.admission.active() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.admission.active(),
+            0,
+            "permit must be released when the stream errors"
         );
     }
 }
