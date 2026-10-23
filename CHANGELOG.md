@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/ecoma-io/kilo-provider/compare/v0.2.0...v0.3.0) (2026-10-23)
+
+
+### Features
+
+* harden runtime reliability and circuit breaker correctness ([#5](https://github.com/ecoma-io/kilo-provider/issues/5)) ([354e9f9](https://github.com/ecoma-io/kilo-provider/commit/354e9f9e0bc090732140a0d3c2091ffcaf17fed3))
+
+
+### Bug Fixes
+
+* admission control, retry safety and circuit breaker correctness ([#7](https://github.com/ecoma-io/kilo-provider/issues/7)) ([73f1d2c](https://github.com/ecoma-io/kilo-provider/commit/73f1d2cec36d5067cb056f8e1263e3eead2d3c43))
+
 ## [0.2.0](https://github.com/ecoma-io/kilo-provider/compare/v0.1.1...v0.2.0) (2026-10-23)
 
 
