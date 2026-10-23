@@ -1,8 +1,9 @@
 //! Circuit breakers with three independent scopes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::CircuitBreakerConfig;
@@ -29,7 +30,9 @@ struct Entry {
     state: BreakerState,
     opened_at: Option<Instant>,
     cooldown: Duration,
-    half_open_inflight: usize,
+    generation: u64,
+    probes: HashSet<u64>,
+    last_touched: Instant,
 }
 
 impl Entry {
@@ -38,22 +41,33 @@ impl Entry {
             state: BreakerState::Closed,
             opened_at: None,
             cooldown: Duration::ZERO,
-            half_open_inflight: 0,
+            generation: 0,
+            probes: HashSet::new(),
+            last_touched: Instant::now(),
         }
     }
 }
 
-/// RAII lease for a transport half-open reservation. Cancels the
-/// reservation (releasing the probe slot) when dropped, including when the
-/// owning future is cancelled/dropped mid-flight.
+static NEXT_LEASE: AtomicU64 = AtomicU64::new(1);
+
+fn next_lease_id() -> u64 {
+    NEXT_LEASE.fetch_add(1, Ordering::Relaxed)
+}
+
+/// RAII lease for a transport half-open reservation.
 pub struct TransportGuard {
     cb: Arc<CircuitBreaker>,
     proxy_id: String,
+    lease_id: u64,
+    pub armed: bool,
 }
 
 impl Drop for TransportGuard {
     fn drop(&mut self) {
-        self.cb.transport_cancel(&self.proxy_id);
+        if self.armed {
+            self.cb
+                .transport_cancel_lease(&self.proxy_id, self.lease_id);
+        }
     }
 }
 
@@ -61,17 +75,41 @@ impl TransportGuard {
     pub fn proxy_id(&self) -> &str {
         &self.proxy_id
     }
+    pub fn lease_id(&self) -> u64 {
+        self.lease_id
+    }
+    pub fn record_success(&mut self) {
+        if self.armed {
+            let _ = self
+                .cb
+                .transport_record_success_lease(&self.proxy_id, self.lease_id);
+            self.armed = false;
+        }
+    }
+    pub fn record_failure(&mut self) {
+        if self.armed {
+            let _ = self
+                .cb
+                .transport_record_failure_lease(&self.proxy_id, self.lease_id);
+            self.armed = false;
+        }
+    }
 }
 
 pub struct RateLimitGuard {
     cb: Arc<CircuitBreaker>,
     proxy_id: String,
     origin: String,
+    lease_id: u64,
+    pub armed: bool,
 }
 
 impl Drop for RateLimitGuard {
     fn drop(&mut self) {
-        self.cb.rate_limit_cancel(&self.proxy_id, &self.origin);
+        if self.armed {
+            self.cb
+                .rate_limit_cancel_lease(&self.proxy_id, &self.origin, self.lease_id);
+        }
     }
 }
 
@@ -82,22 +120,69 @@ impl RateLimitGuard {
     pub fn origin(&self) -> &str {
         &self.origin
     }
+    pub fn lease_id(&self) -> u64 {
+        self.lease_id
+    }
+    pub fn record_success(&mut self) {
+        if self.armed {
+            let _ = self.cb.rate_limit_record_success_lease(
+                &self.proxy_id,
+                &self.origin,
+                self.lease_id,
+            );
+            self.armed = false;
+        }
+    }
+    pub fn record_failure(&mut self, retry_after: Option<Duration>) {
+        if self.armed {
+            let _ = self.cb.rate_limit_record_failure_lease(
+                &self.proxy_id,
+                &self.origin,
+                self.lease_id,
+                retry_after,
+            );
+            self.armed = false;
+        }
+    }
 }
 
 pub struct ModelGuard {
     cb: Arc<CircuitBreaker>,
     model_id: String,
+    lease_id: u64,
+    pub armed: bool,
 }
 
 impl Drop for ModelGuard {
     fn drop(&mut self) {
-        self.cb.model_cancel(&self.model_id);
+        if self.armed {
+            self.cb.model_cancel_lease(&self.model_id, self.lease_id);
+        }
     }
 }
 
 impl ModelGuard {
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+    pub fn lease_id(&self) -> u64 {
+        self.lease_id
+    }
+    pub fn record_success(&mut self) {
+        if self.armed {
+            let _ = self
+                .cb
+                .model_record_success_lease(&self.model_id, self.lease_id);
+            self.armed = false;
+        }
+    }
+    pub fn record_failure(&mut self) {
+        if self.armed {
+            let _ = self
+                .cb
+                .model_record_failure_lease(&self.model_id, self.lease_id);
+            self.armed = false;
+        }
     }
 }
 
@@ -115,6 +200,7 @@ impl Default for CircuitBreaker {
             rate_limit_cooldown_secs: 120,
             model_not_found_cooldown_secs: 300,
             half_open_max_probes: 1,
+            retry_after_max_secs: 300,
         })
     }
 }
@@ -140,23 +226,23 @@ impl CircuitBreaker {
     fn prune_map<K: std::cmp::Eq + std::hash::Hash>(map: &mut HashMap<K, Entry>) {
         let now = Instant::now();
         map.retain(|_, e| match e.state {
-            BreakerState::Closed => true,
-            BreakerState::Open => e
-                .opened_at
-                .map(|o| {
-                    now.duration_since(o) < e.cooldown.saturating_mul(2).max(Duration::from_secs(1))
-                })
-                .unwrap_or(false),
+            BreakerState::Closed => now.duration_since(e.last_touched) <= Duration::from_secs(300),
+            BreakerState::Open => true,
             BreakerState::HalfOpen => true,
         });
     }
 
+    fn cfg(&self) -> CircuitBreakerConfig {
+        self.config()
+    }
+
     // transport
     pub fn transport_check(&self, proxy_id: &str) -> bool {
-        let cfg = self.config();
+        let cfg = self.cfg();
         let mut map = self.transport.lock().unwrap();
         Self::prune_map(&mut map);
         let e = map.entry(proxy_id.to_string()).or_insert_with(Entry::new);
+        e.last_touched = Instant::now();
         check_entry(e, cfg.half_open_max_probes)
     }
     pub fn transport_allow(&self, proxy_id: &str) -> bool {
@@ -167,11 +253,20 @@ impl CircuitBreaker {
     }
 
     pub fn transport_reserve(&self, proxy_id: &str) -> bool {
-        let cfg = self.config();
+        self.transport_reserve_lease(proxy_id).is_some()
+    }
+    pub fn transport_reserve_lease(&self, proxy_id: &str) -> Option<u64> {
+        let cfg = self.cfg();
+        let lease_id = next_lease_id();
         let mut map = self.transport.lock().unwrap();
         Self::prune_map(&mut map);
         let e = map.entry(proxy_id.to_string()).or_insert_with(Entry::new);
-        reserve_entry(e, cfg.half_open_max_probes)
+        e.last_touched = Instant::now();
+        if reserve_entry(e, cfg.half_open_max_probes, lease_id) {
+            Some(lease_id)
+        } else {
+            None
+        }
     }
     pub fn transport_try_acquire(&self, proxy_id: &str) -> bool {
         self.transport_reserve(proxy_id)
@@ -183,7 +278,15 @@ impl CircuitBreaker {
     pub fn transport_cancel(&self, proxy_id: &str) {
         let mut map = self.transport.lock().unwrap();
         if let Some(e) = map.get_mut(proxy_id) {
-            cancel_entry(e);
+            e.probes.clear();
+            e.last_touched = Instant::now();
+        }
+    }
+    pub fn transport_cancel_lease(&self, proxy_id: &str, lease_id: u64) {
+        let mut map = self.transport.lock().unwrap();
+        if let Some(e) = map.get_mut(proxy_id) {
+            e.probes.remove(&lease_id);
+            e.last_touched = Instant::now();
         }
     }
     pub fn transport_release(&self, proxy_id: &str) {
@@ -195,33 +298,114 @@ impl CircuitBreaker {
 
     pub fn transport_record_success(&self, proxy_id: &str) {
         let mut map = self.transport.lock().unwrap();
+        Self::prune_map(&mut map);
         if let Some(e) = map.get_mut(proxy_id) {
             e.state = BreakerState::Closed;
             e.opened_at = None;
             e.cooldown = Duration::ZERO;
-            e.half_open_inflight = 0;
+            e.probes.clear();
+            e.last_touched = Instant::now();
         }
+    }
+    pub fn transport_record_success_lease(&self, proxy_id: &str, lease_id: u64) -> bool {
+        let mut map = self.transport.lock().unwrap();
+        Self::prune_map(&mut map);
+        if let Some(e) = map.get_mut(proxy_id) {
+            e.last_touched = Instant::now();
+            if e.probes.remove(&lease_id) {
+                e.state = BreakerState::Closed;
+                e.opened_at = None;
+                e.cooldown = Duration::ZERO;
+                e.probes.clear();
+                return true;
+            }
+        }
+        false
     }
 
     pub fn transport_record_failure(&self, proxy_id: &str) {
-        let cfg = self.config();
+        let cfg = self.cfg();
         let cooldown = Duration::from_secs(cfg.proxy_failure_cooldown_secs);
         let mut map = self.transport.lock().unwrap();
+        Self::prune_map(&mut map);
         let e = map.entry(proxy_id.to_string()).or_insert_with(Entry::new);
         e.state = BreakerState::Open;
         e.opened_at = Some(Instant::now());
         e.cooldown = cooldown;
-        e.half_open_inflight = 0;
+        e.probes.clear();
+        e.generation = e.generation.wrapping_add(1);
+        e.last_touched = Instant::now();
+    }
+    pub fn transport_record_failure_lease(&self, proxy_id: &str, lease_id: u64) -> bool {
+        let cfg = self.cfg();
+        let cooldown = Duration::from_secs(cfg.proxy_failure_cooldown_secs);
+        let mut map = self.transport.lock().unwrap();
+        Self::prune_map(&mut map);
+        if let Some(e) = map.get_mut(proxy_id) {
+            e.last_touched = Instant::now();
+            if e.probes.remove(&lease_id) {
+                e.state = BreakerState::Open;
+                e.opened_at = Some(Instant::now());
+                e.cooldown = cooldown;
+                e.probes.clear();
+                e.generation = e.generation.wrapping_add(1);
+                return true;
+            }
+            return false;
+        }
+        false
+    }
+
+    pub fn transport_record_failure_outcome(&self, proxy_id: &str, lease_id: u64) -> bool {
+        let cfg = self.cfg();
+        let cooldown = Duration::from_secs(cfg.proxy_failure_cooldown_secs);
+        let mut map = self.transport.lock().unwrap();
+        Self::prune_map(&mut map);
+        let e = map.entry(proxy_id.to_string()).or_insert_with(Entry::new);
+        e.last_touched = Instant::now();
+        let owned = lease_id != 0 && e.probes.remove(&lease_id);
+        if owned || e.state == BreakerState::Closed {
+            e.state = BreakerState::Open;
+            e.opened_at = Some(Instant::now());
+            e.cooldown = cooldown;
+            e.probes.clear();
+            e.generation = e.generation.wrapping_add(1);
+            return true;
+        }
+        false
+    }
+
+    pub fn transport_record_success_outcome(&self, proxy_id: &str, lease_id: u64) -> bool {
+        let mut map = self.transport.lock().unwrap();
+        Self::prune_map(&mut map);
+        if let Some(e) = map.get_mut(proxy_id) {
+            e.last_touched = Instant::now();
+            let owned = lease_id != 0 && e.probes.remove(&lease_id);
+            if owned {
+                e.state = BreakerState::Closed;
+                e.opened_at = None;
+                e.cooldown = Duration::ZERO;
+                e.probes.clear();
+                return true;
+            }
+            if e.state == BreakerState::Closed {
+                return true;
+            }
+            false
+        } else {
+            false
+        }
     }
 
     // rate limit
     pub fn rate_limit_check(&self, proxy_id: &str, origin: &str) -> bool {
-        let cfg = self.config();
+        let cfg = self.cfg();
         let mut map = self.rate_limit.lock().unwrap();
         Self::prune_map(&mut map);
         let e = map
             .entry((proxy_id.to_string(), origin.to_string()))
             .or_insert_with(Entry::new);
+        e.last_touched = Instant::now();
         check_entry(e, cfg.half_open_max_probes)
     }
     pub fn rate_limit_allow(&self, proxy_id: &str, origin: &str) -> bool {
@@ -232,13 +416,22 @@ impl CircuitBreaker {
     }
 
     pub fn rate_limit_reserve(&self, proxy_id: &str, origin: &str) -> bool {
-        let cfg = self.config();
+        self.rate_limit_reserve_lease(proxy_id, origin).is_some()
+    }
+    pub fn rate_limit_reserve_lease(&self, proxy_id: &str, origin: &str) -> Option<u64> {
+        let cfg = self.cfg();
+        let lease_id = next_lease_id();
         let mut map = self.rate_limit.lock().unwrap();
         Self::prune_map(&mut map);
         let e = map
             .entry((proxy_id.to_string(), origin.to_string()))
             .or_insert_with(Entry::new);
-        reserve_entry(e, cfg.half_open_max_probes)
+        e.last_touched = Instant::now();
+        if reserve_entry(e, cfg.half_open_max_probes, lease_id) {
+            Some(lease_id)
+        } else {
+            None
+        }
     }
     pub fn rate_limit_try_acquire(&self, proxy_id: &str, origin: &str) -> bool {
         self.rate_limit_reserve(proxy_id, origin)
@@ -250,7 +443,15 @@ impl CircuitBreaker {
     pub fn rate_limit_cancel(&self, proxy_id: &str, origin: &str) {
         let mut map = self.rate_limit.lock().unwrap();
         if let Some(e) = map.get_mut(&(proxy_id.to_string(), origin.to_string())) {
-            cancel_entry(e);
+            e.probes.clear();
+            e.last_touched = Instant::now();
+        }
+    }
+    pub fn rate_limit_cancel_lease(&self, proxy_id: &str, origin: &str, lease_id: u64) {
+        let mut map = self.rate_limit.lock().unwrap();
+        if let Some(e) = map.get_mut(&(proxy_id.to_string(), origin.to_string())) {
+            e.probes.remove(&lease_id);
+            e.last_touched = Instant::now();
         }
     }
     pub fn rate_limit_release(&self, proxy_id: &str, origin: &str) {
@@ -262,12 +463,34 @@ impl CircuitBreaker {
 
     pub fn rate_limit_record_success(&self, proxy_id: &str, origin: &str) {
         let mut map = self.rate_limit.lock().unwrap();
+        Self::prune_map(&mut map);
         if let Some(e) = map.get_mut(&(proxy_id.to_string(), origin.to_string())) {
             e.state = BreakerState::Closed;
             e.opened_at = None;
             e.cooldown = Duration::ZERO;
-            e.half_open_inflight = 0;
+            e.probes.clear();
+            e.last_touched = Instant::now();
         }
+    }
+    pub fn rate_limit_record_success_lease(
+        &self,
+        proxy_id: &str,
+        origin: &str,
+        lease_id: u64,
+    ) -> bool {
+        let mut map = self.rate_limit.lock().unwrap();
+        Self::prune_map(&mut map);
+        if let Some(e) = map.get_mut(&(proxy_id.to_string(), origin.to_string())) {
+            e.last_touched = Instant::now();
+            if e.probes.remove(&lease_id) {
+                e.state = BreakerState::Closed;
+                e.opened_at = None;
+                e.cooldown = Duration::ZERO;
+                e.probes.clear();
+                return true;
+            }
+        }
+        false
     }
 
     pub fn rate_limit_record_failure(
@@ -276,25 +499,122 @@ impl CircuitBreaker {
         origin: &str,
         retry_after: Option<Duration>,
     ) {
-        let cfg = self.config();
-        let cooldown =
+        let cfg = self.cfg();
+        let mut cooldown =
             retry_after.unwrap_or_else(|| Duration::from_secs(cfg.rate_limit_cooldown_secs));
+        let max = Duration::from_secs(cfg.retry_after_max_secs.max(1));
+        if cooldown > max {
+            cooldown = max;
+        }
         let mut map = self.rate_limit.lock().unwrap();
+        Self::prune_map(&mut map);
         let e = map
             .entry((proxy_id.to_string(), origin.to_string()))
             .or_insert_with(Entry::new);
         e.state = BreakerState::Open;
         e.opened_at = Some(Instant::now());
         e.cooldown = cooldown;
-        e.half_open_inflight = 0;
+        e.probes.clear();
+        e.generation = e.generation.wrapping_add(1);
+        e.last_touched = Instant::now();
+    }
+    pub fn rate_limit_record_failure_lease(
+        &self,
+        proxy_id: &str,
+        origin: &str,
+        lease_id: u64,
+        retry_after: Option<Duration>,
+    ) -> bool {
+        let cfg = self.cfg();
+        let mut cooldown =
+            retry_after.unwrap_or_else(|| Duration::from_secs(cfg.rate_limit_cooldown_secs));
+        let max = Duration::from_secs(cfg.retry_after_max_secs.max(1));
+        if cooldown > max {
+            cooldown = max;
+        }
+        let mut map = self.rate_limit.lock().unwrap();
+        Self::prune_map(&mut map);
+        if let Some(e) = map.get_mut(&(proxy_id.to_string(), origin.to_string())) {
+            e.last_touched = Instant::now();
+            if e.probes.remove(&lease_id) {
+                e.state = BreakerState::Open;
+                e.opened_at = Some(Instant::now());
+                e.cooldown = cooldown;
+                e.probes.clear();
+                e.generation = e.generation.wrapping_add(1);
+                return true;
+            }
+            return false;
+        }
+        false
+    }
+
+    pub fn rate_limit_record_failure_outcome(
+        &self,
+        proxy_id: &str,
+        origin: &str,
+        lease_id: u64,
+        retry_after: Option<Duration>,
+    ) -> bool {
+        let cfg = self.cfg();
+        let mut cooldown =
+            retry_after.unwrap_or_else(|| Duration::from_secs(cfg.rate_limit_cooldown_secs));
+        let max = Duration::from_secs(cfg.retry_after_max_secs.max(1));
+        if cooldown > max {
+            cooldown = max;
+        }
+        let mut map = self.rate_limit.lock().unwrap();
+        Self::prune_map(&mut map);
+        let e = map
+            .entry((proxy_id.to_string(), origin.to_string()))
+            .or_insert_with(Entry::new);
+        e.last_touched = Instant::now();
+        let owned = lease_id != 0 && e.probes.remove(&lease_id);
+        if owned || e.state == BreakerState::Closed || e.state == BreakerState::Open {
+            e.state = BreakerState::Open;
+            e.opened_at = Some(Instant::now());
+            e.cooldown = cooldown;
+            e.probes.clear();
+            e.generation = e.generation.wrapping_add(1);
+            return true;
+        }
+        false
+    }
+
+    pub fn rate_limit_record_success_outcome(
+        &self,
+        proxy_id: &str,
+        origin: &str,
+        lease_id: u64,
+    ) -> bool {
+        let mut map = self.rate_limit.lock().unwrap();
+        Self::prune_map(&mut map);
+        if let Some(e) = map.get_mut(&(proxy_id.to_string(), origin.to_string())) {
+            e.last_touched = Instant::now();
+            let owned = lease_id != 0 && e.probes.remove(&lease_id);
+            if owned {
+                e.state = BreakerState::Closed;
+                e.opened_at = None;
+                e.cooldown = Duration::ZERO;
+                e.probes.clear();
+                return true;
+            }
+            if e.state == BreakerState::Closed {
+                return true;
+            }
+            false
+        } else {
+            false
+        }
     }
 
     // model
     pub fn model_check(&self, model_id: &str) -> bool {
-        let cfg = self.config();
+        let cfg = self.cfg();
         let mut map = self.model.lock().unwrap();
         Self::prune_map(&mut map);
         let e = map.entry(model_id.to_string()).or_insert_with(Entry::new);
+        e.last_touched = Instant::now();
         check_entry(e, cfg.half_open_max_probes)
     }
     pub fn model_allow(&self, model_id: &str) -> bool {
@@ -305,11 +625,20 @@ impl CircuitBreaker {
     }
 
     pub fn model_reserve(&self, model_id: &str) -> bool {
-        let cfg = self.config();
+        self.model_reserve_lease(model_id).is_some()
+    }
+    pub fn model_reserve_lease(&self, model_id: &str) -> Option<u64> {
+        let cfg = self.cfg();
+        let lease_id = next_lease_id();
         let mut map = self.model.lock().unwrap();
         Self::prune_map(&mut map);
         let e = map.entry(model_id.to_string()).or_insert_with(Entry::new);
-        reserve_entry(e, cfg.half_open_max_probes)
+        e.last_touched = Instant::now();
+        if reserve_entry(e, cfg.half_open_max_probes, lease_id) {
+            Some(lease_id)
+        } else {
+            None
+        }
     }
     pub fn model_try_acquire(&self, model_id: &str) -> bool {
         self.model_reserve(model_id)
@@ -321,7 +650,15 @@ impl CircuitBreaker {
     pub fn model_cancel(&self, model_id: &str) {
         let mut map = self.model.lock().unwrap();
         if let Some(e) = map.get_mut(model_id) {
-            cancel_entry(e);
+            e.probes.clear();
+            e.last_touched = Instant::now();
+        }
+    }
+    pub fn model_cancel_lease(&self, model_id: &str, lease_id: u64) {
+        let mut map = self.model.lock().unwrap();
+        if let Some(e) = map.get_mut(model_id) {
+            e.probes.remove(&lease_id);
+            e.last_touched = Instant::now();
         }
     }
     pub fn model_release(&self, model_id: &str) {
@@ -333,35 +670,113 @@ impl CircuitBreaker {
 
     pub fn model_record_success(&self, model_id: &str) {
         let mut map = self.model.lock().unwrap();
+        Self::prune_map(&mut map);
         if let Some(e) = map.get_mut(model_id) {
             e.state = BreakerState::Closed;
             e.opened_at = None;
             e.cooldown = Duration::ZERO;
-            e.half_open_inflight = 0;
+            e.probes.clear();
+            e.last_touched = Instant::now();
         }
+    }
+    pub fn model_record_success_lease(&self, model_id: &str, lease_id: u64) -> bool {
+        let mut map = self.model.lock().unwrap();
+        Self::prune_map(&mut map);
+        if let Some(e) = map.get_mut(model_id) {
+            e.last_touched = Instant::now();
+            if e.probes.remove(&lease_id) {
+                e.state = BreakerState::Closed;
+                e.opened_at = None;
+                e.cooldown = Duration::ZERO;
+                e.probes.clear();
+                return true;
+            }
+        }
+        false
     }
 
     pub fn model_record_failure(&self, model_id: &str) {
-        let cfg = self.config();
+        let cfg = self.cfg();
         let cooldown = Duration::from_secs(cfg.model_not_found_cooldown_secs);
         let mut map = self.model.lock().unwrap();
+        Self::prune_map(&mut map);
         let e = map.entry(model_id.to_string()).or_insert_with(Entry::new);
         e.state = BreakerState::Open;
         e.opened_at = Some(Instant::now());
         e.cooldown = cooldown;
-        e.half_open_inflight = 0;
+        e.probes.clear();
+        e.generation = e.generation.wrapping_add(1);
+        e.last_touched = Instant::now();
+    }
+    pub fn model_record_failure_lease(&self, model_id: &str, lease_id: u64) -> bool {
+        let cfg = self.cfg();
+        let cooldown = Duration::from_secs(cfg.model_not_found_cooldown_secs);
+        let mut map = self.model.lock().unwrap();
+        Self::prune_map(&mut map);
+        if let Some(e) = map.get_mut(model_id) {
+            e.last_touched = Instant::now();
+            if e.probes.remove(&lease_id) {
+                e.state = BreakerState::Open;
+                e.opened_at = Some(Instant::now());
+                e.cooldown = cooldown;
+                e.probes.clear();
+                e.generation = e.generation.wrapping_add(1);
+                return true;
+            }
+            return false;
+        }
+        false
+    }
+    pub fn model_record_failure_outcome(&self, model_id: &str, lease_id: u64) -> bool {
+        let cfg = self.cfg();
+        let cooldown = Duration::from_secs(cfg.model_not_found_cooldown_secs);
+        let mut map = self.model.lock().unwrap();
+        Self::prune_map(&mut map);
+        let e = map.entry(model_id.to_string()).or_insert_with(Entry::new);
+        e.last_touched = Instant::now();
+        let owned = lease_id != 0 && e.probes.remove(&lease_id);
+        if owned || e.state == BreakerState::Closed {
+            e.state = BreakerState::Open;
+            e.opened_at = Some(Instant::now());
+            e.cooldown = cooldown;
+            e.probes.clear();
+            e.generation = e.generation.wrapping_add(1);
+            return true;
+        }
+        false
     }
 
-    // RAII guards (leak-safe on cancellation/drop).
+    pub fn model_record_success_outcome(&self, model_id: &str, lease_id: u64) -> bool {
+        let mut map = self.model.lock().unwrap();
+        Self::prune_map(&mut map);
+        if let Some(e) = map.get_mut(model_id) {
+            e.last_touched = Instant::now();
+            let owned = lease_id != 0 && e.probes.remove(&lease_id);
+            if owned {
+                e.state = BreakerState::Closed;
+                e.opened_at = None;
+                e.cooldown = Duration::ZERO;
+                e.probes.clear();
+                return true;
+            }
+            if e.state == BreakerState::Closed {
+                return true;
+            }
+            false
+        } else {
+            false
+        }
+    }
+
+    // RAII guards
     pub fn transport_reserve_guard(self: &Arc<Self>, proxy_id: &str) -> Option<TransportGuard> {
-        if self.transport_reserve(proxy_id) {
-            Some(TransportGuard {
+        self.transport_reserve_lease(proxy_id)
+            .map(|lease_id| TransportGuard {
                 cb: self.clone(),
                 proxy_id: proxy_id.to_string(),
+                lease_id,
+                armed: true,
             })
-        } else {
-            None
-        }
     }
     pub fn transport_lease(self: &Arc<Self>, proxy_id: &str) -> Option<TransportGuard> {
         self.transport_reserve_guard(proxy_id)
@@ -378,15 +793,14 @@ impl CircuitBreaker {
         proxy_id: &str,
         origin: &str,
     ) -> Option<RateLimitGuard> {
-        if self.rate_limit_reserve(proxy_id, origin) {
-            Some(RateLimitGuard {
+        self.rate_limit_reserve_lease(proxy_id, origin)
+            .map(|lease_id| RateLimitGuard {
                 cb: self.clone(),
                 proxy_id: proxy_id.to_string(),
                 origin: origin.to_string(),
+                lease_id,
+                armed: true,
             })
-        } else {
-            None
-        }
     }
     pub fn rate_limit_lease(
         self: &Arc<Self>,
@@ -397,25 +811,24 @@ impl CircuitBreaker {
     }
 
     pub fn model_reserve_guard(self: &Arc<Self>, model_id: &str) -> Option<ModelGuard> {
-        if self.model_reserve(model_id) {
-            Some(ModelGuard {
+        self.model_reserve_lease(model_id)
+            .map(|lease_id| ModelGuard {
                 cb: self.clone(),
                 model_id: model_id.to_string(),
+                lease_id,
+                armed: true,
             })
-        } else {
-            None
-        }
     }
     pub fn model_lease(self: &Arc<Self>, model_id: &str) -> Option<ModelGuard> {
         self.model_reserve_guard(model_id)
     }
 
-    // Non-reserving RAII guards: attach leak-safe cancellation to a slot that
-    // has already been reserved (e.g. by ProxyPool::reserve). Drop cancels.
     pub fn transport_guard(self: &Arc<Self>, proxy_id: &str) -> TransportGuard {
         TransportGuard {
             cb: self.clone(),
             proxy_id: proxy_id.to_string(),
+            lease_id: 0,
+            armed: false,
         }
     }
     pub fn rate_limit_guard(self: &Arc<Self>, proxy_id: &str, origin: &str) -> RateLimitGuard {
@@ -423,13 +836,33 @@ impl CircuitBreaker {
             cb: self.clone(),
             proxy_id: proxy_id.to_string(),
             origin: origin.to_string(),
+            lease_id: 0,
+            armed: false,
         }
     }
     pub fn model_guard(self: &Arc<Self>, model_id: &str) -> ModelGuard {
         ModelGuard {
             cb: self.clone(),
             model_id: model_id.to_string(),
+            lease_id: 0,
+            armed: false,
         }
+    }
+
+    // cleanup
+    pub fn retain_proxies(&self, active: &HashSet<String>) {
+        {
+            let mut map = self.transport.lock().unwrap();
+            map.retain(|k, e| active.contains(k) || !e.probes.is_empty());
+        }
+        {
+            let mut map = self.rate_limit.lock().unwrap();
+            map.retain(|(pid, _), e| active.contains(pid) || !e.probes.is_empty());
+        }
+    }
+    pub fn retain_models(&self, active: &HashSet<String>) {
+        let mut map = self.model.lock().unwrap();
+        map.retain(|k, e| active.contains(k) || !e.probes.is_empty());
     }
 
     // helpers
@@ -462,12 +895,29 @@ impl CircuitBreaker {
             .lock()
             .unwrap()
             .get(proxy_id)
-            .map(|e| e.half_open_inflight)
+            .map(|e| e.probes.len())
+            .unwrap_or(0)
+    }
+    pub fn half_open_inflight_rate_limit(&self, proxy_id: &str, origin: &str) -> usize {
+        self.rate_limit
+            .lock()
+            .unwrap()
+            .get(&(proxy_id.to_string(), origin.to_string()))
+            .map(|e| e.probes.len())
+            .unwrap_or(0)
+    }
+    pub fn half_open_inflight_model(&self, model_id: &str) -> usize {
+        self.model
+            .lock()
+            .unwrap()
+            .get(model_id)
+            .map(|e| e.probes.len())
             .unwrap_or(0)
     }
 }
 
 fn check_entry(e: &mut Entry, half_open_max: usize) -> bool {
+    e.last_touched = Instant::now();
     match e.state {
         BreakerState::Closed => true,
         BreakerState::Open => {
@@ -479,11 +929,12 @@ fn check_entry(e: &mut Entry, half_open_max: usize) -> bool {
                 false
             }
         }
-        BreakerState::HalfOpen => e.half_open_inflight < half_open_max,
+        BreakerState::HalfOpen => e.probes.len() < half_open_max,
     }
 }
 
-fn reserve_entry(e: &mut Entry, half_open_max: usize) -> bool {
+fn reserve_entry(e: &mut Entry, half_open_max: usize, lease_id: u64) -> bool {
+    e.last_touched = Instant::now();
     match e.state {
         BreakerState::Closed => true,
         BreakerState::Open => {
@@ -491,9 +942,9 @@ fn reserve_entry(e: &mut Entry, half_open_max: usize) -> bool {
                 && opened.elapsed() >= e.cooldown
             {
                 e.state = BreakerState::HalfOpen;
-                e.half_open_inflight = 0;
-                if e.half_open_inflight < half_open_max {
-                    e.half_open_inflight += 1;
+                e.probes.clear();
+                if e.probes.len() < half_open_max {
+                    e.probes.insert(lease_id);
                     return true;
                 }
                 false
@@ -502,19 +953,13 @@ fn reserve_entry(e: &mut Entry, half_open_max: usize) -> bool {
             }
         }
         BreakerState::HalfOpen => {
-            if e.half_open_inflight < half_open_max {
-                e.half_open_inflight += 1;
+            if e.probes.len() < half_open_max {
+                e.probes.insert(lease_id);
                 true
             } else {
                 false
             }
         }
-    }
-}
-
-fn cancel_entry(e: &mut Entry) {
-    if e.state == BreakerState::HalfOpen && e.half_open_inflight > 0 {
-        e.half_open_inflight -= 1;
     }
 }
 
@@ -529,6 +974,7 @@ mod tests {
             rate_limit_cooldown_secs: 120,
             model_not_found_cooldown_secs: 300,
             half_open_max_probes: 1,
+            retry_after_max_secs: 300,
         }
     }
 
@@ -588,6 +1034,7 @@ mod tests {
         let cb = CircuitBreaker::new(CircuitBreakerConfig {
             proxy_failure_cooldown_secs: 0,
             half_open_max_probes: 1,
+            retry_after_max_secs: 300,
             ..cfg()
         });
         cb.transport_record_failure("p0");
@@ -603,6 +1050,7 @@ mod tests {
         let cb = CircuitBreaker::new(CircuitBreakerConfig {
             proxy_failure_cooldown_secs: 0,
             half_open_max_probes: 1,
+            retry_after_max_secs: 300,
             ..cfg()
         });
         cb.transport_record_failure("p0");
@@ -620,6 +1068,7 @@ mod tests {
         let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
             proxy_failure_cooldown_secs: 0,
             half_open_max_probes: 1,
+            retry_after_max_secs: 300,
             ..cfg()
         }));
         cb.transport_record_failure("p0");
@@ -630,8 +1079,6 @@ mod tests {
             std::future::pending::<()>().await;
         };
         let _ = tokio::time::timeout(Duration::from_millis(20), fut).await;
-        // The future was cancelled; the guard must have released the slot,
-        // so a new probe can acquire it without another failure transition.
         assert!(
             cb.transport_reserve("p0"),
             "subsequent probe must acquire after cancellation"
@@ -644,6 +1091,7 @@ mod tests {
         let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
             rate_limit_cooldown_secs: 0,
             half_open_max_probes: 1,
+            retry_after_max_secs: 300,
             ..cfg()
         }));
         cb.rate_limit_record_failure("p0", "origin", None);
@@ -668,6 +1116,7 @@ mod tests {
         let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
             model_not_found_cooldown_secs: 0,
             half_open_max_probes: 1,
+            retry_after_max_secs: 300,
             ..cfg()
         }));
         cb.model_record_failure("m0");
@@ -689,6 +1138,7 @@ mod tests {
         let cb = CircuitBreaker::new(CircuitBreakerConfig {
             proxy_failure_cooldown_secs: 0,
             half_open_max_probes: 1,
+            retry_after_max_secs: 300,
             ..cfg()
         });
         cb.transport_record_failure("p0");
@@ -705,6 +1155,7 @@ mod tests {
         let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
             proxy_failure_cooldown_secs: 0,
             half_open_max_probes: 1,
+            retry_after_max_secs: 300,
             ..cfg()
         }));
         cb.transport_record_failure("p0");

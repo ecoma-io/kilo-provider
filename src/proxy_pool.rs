@@ -66,7 +66,12 @@ impl ProxyPool {
 
     pub fn fingerprint_of(config: &ProxyPoolConfig) -> String {
         let mut h = Sha256::new();
+        h.update(config.reload_interval_secs.to_le_bytes());
         h.update(config.connect_timeout_secs.to_le_bytes());
+        h.update(config.max_concurrent_requests.to_le_bytes());
+        h.update(config.request_body_timeout_secs.to_le_bytes());
+        h.update(config.response_header_timeout_secs.to_le_bytes());
+        h.update(config.stream_idle_timeout_secs.to_le_bytes());
         for p in &config.proxies {
             h.update(p.as_bytes());
             h.update(b"\n");
@@ -91,9 +96,9 @@ impl ProxyPool {
                 AppError::Config(format!("invalid URL in '[proxy_pool] proxies': {err}"))
             })?;
             let scheme = url.scheme();
-            if scheme != "http" && scheme != "https" && scheme != "socks5" && scheme != "socks5h" {
+            if scheme != "http" {
                 return Err(AppError::Config(
-                    "unsupported proxy scheme in '[proxy_pool] proxies'".to_string(),
+                    "proxy pool supports only http:// proxies".to_string(),
                 ));
             }
             // Build client routed through this proxy explicitly; ignore env proxies.
@@ -378,7 +383,7 @@ rate_limit_cooldown_secs = 1
 model_not_found_cooldown_secs = 1
 half_open_max_probes = 1
 "#;
-        let err = pool_from(toml).unwrap_err();
+        let err = Config::from_toml(toml).unwrap_err();
         assert!(
             err.to_string().contains("[proxy_pool] proxies")
                 || err.to_string().contains("proxy_pool")
