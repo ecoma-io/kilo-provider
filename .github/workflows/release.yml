@@ -200,9 +200,26 @@ jobs:
   publish-ghcr:
     name: Publish image to GHCR
     needs: [release-please, bootstrap-release]
+    # NOTE: `always()` is required here, not just the event/output checks.
+    # This job needs both the push-only `release-please` job and the
+    # workflow_dispatch-only `bootstrap-release` job, so exactly one of them is
+    # always skipped. GitHub Actions skips a job whose `needs` contains a
+    # skipped job unless its `if` explicitly opts out with `always()` /
+    # `!cancelled()`. Without `always()`, a successful release-please run still
+    # skipped this job and no image was ever published (v0.2.0, v0.3.0).
+    # The explicit `result`/output checks below keep the opt-out safe: nothing
+    # is published unless the job that actually performs the release succeeded.
     if: >-
-      (github.event_name == 'push' && needs.release-please.outputs.release_created == 'true' && contains(fromJSON(needs.release-please.outputs.paths_released || '[]'), '.')) ||
-      (github.event_name == 'workflow_dispatch')
+      always() && (
+      (github.event_name == 'push' &&
+      needs.release-please.result == 'success' &&
+      needs.release-please.outputs.release_created == 'true' &&
+      contains(fromJSON(needs.release-please.outputs.paths_released || '[]'), '.')) ||
+      (github.event_name == 'workflow_dispatch' &&
+      needs.bootstrap-release.result == 'success' &&
+      needs.bootstrap-release.outputs.release_created == 'true' &&
+      needs.bootstrap-release.outputs.tag_name != '')
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -222,14 +239,23 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "tag_name=${BOOTSTRAP_TAG}" >> "$GITHUB_OUTPUT"
-            echo "version=${BOOTSTRAP_VERSION}" >> "$GITHUB_OUTPUT"
-            echo "sha=${BOOTSTRAP_SHA}" >> "$GITHUB_OUTPUT"
+            tag_name="${BOOTSTRAP_TAG}"
+            version="${BOOTSTRAP_VERSION}"
+            sha="${BOOTSTRAP_SHA}"
           else
-            echo "tag_name=${RELEASE_PLEASE_TAG}" >> "$GITHUB_OUTPUT"
-            echo "version=${RELEASE_PLEASE_VERSION}" >> "$GITHUB_OUTPUT"
-            echo "sha=${RELEASE_PLEASE_SHA}" >> "$GITHUB_OUTPUT"
+            tag_name="${RELEASE_PLEASE_TAG}"
+            version="${RELEASE_PLEASE_VERSION}"
+            sha="${RELEASE_PLEASE_SHA}"
           fi
+          # Fail fast with an actionable error instead of checking out an empty
+          # ref / validating empty metadata later.
+          if [ -z "$tag_name" ] || [ -z "$version" ] || [ -z "$sha" ]; then
+            echo "::error::missing release params (tag='${tag_name}' version='${version}' sha='${sha}')"
+            exit 1
+          fi
+          echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
 
       - name: Check out release tag
         id: checkout
