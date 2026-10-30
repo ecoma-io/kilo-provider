@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/ecoma-io/kilo-provider/compare/v0.3.0...v0.3.1) (2026-10-30)
+
+
+### Bug Fixes
+
+* **release:** publish image when bootstrap job is skipped ([#8](https://github.com/ecoma-io/kilo-provider/issues/8)) ([b9d17bb](https://github.com/ecoma-io/kilo-provider/commit/b9d17bb2a10ef75673afd13ca64f5844670341de))
+
 ## [0.3.0](https://github.com/ecoma-io/kilo-provider/compare/v0.2.0...v0.3.0) (2026-10-23)
 
 
